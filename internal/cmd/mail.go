@@ -468,6 +468,17 @@ func detectSender() string {
 		}
 	}
 
+	// If in a rig's crew directory, extract address
+	if strings.Contains(cwd, "/crew/") {
+		parts := strings.Split(cwd, "/crew/")
+		if len(parts) >= 2 {
+			rigPath := parts[0]
+			crewName := strings.Split(parts[1], "/")[0]
+			rigName := filepath.Base(rigPath)
+			return fmt.Sprintf("%s/%s", rigName, crewName)
+		}
+	}
+
 	// Default to mayor
 	return "mayor/"
 }
