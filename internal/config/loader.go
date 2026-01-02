@@ -738,7 +738,9 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 	}
 
 	// Build environment export prefix
+	// Always include GASTOWN_MODE=1 to signal Claude Code hooks that this is a Gastown session
 	var exports []string
+	exports = append(exports, "GASTOWN_MODE=1")
 	for k, v := range envVars {
 		exports = append(exports, fmt.Sprintf("%s=%s", k, v))
 	}
