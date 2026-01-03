@@ -29,7 +29,7 @@ SAI operates at the **Claude Code layer** (hooks, skills, memory) while Gas Town
 | Usage-aware routing | ENABLED | `GASTOWN_ENABLE_USAGE=1` |
 | Multi-model routing | ENABLED | See `docs/multi-model-routing.md` |
 | Watcher (self-improve) | TODO | Port as Deacon dog |
-| Artifact indexing | TODO | Enable PostToolUse hook |
+| Artifact indexing | SUPERSEDED | Use Beads instead |
 
 ---
 
@@ -212,16 +212,19 @@ const memories = await mem0.search(currentTask);
 
 ---
 
-### 10. Artifact Indexing
+### 10. Artifact Indexing ⏸️ SUPERSEDED
+
+**Status**: Beads handles this better
 
 **What it does**: PostToolUse hook indexes created files for full-text search.
 
-**Use case**: Find past work, search handoffs, locate decisions
+**Why Beads is better**:
+- Already queryable via `bd list`, `bd show`, SQLite
+- Already git-synced
+- No separate index to maintain
+- Native search: `sqlite3 .beads/beads.db "SELECT * FROM issues WHERE title LIKE '%query%'"`
 
-**Integration point**: PostToolUse hook
-
-**Effort**: Low
-**Value**: Low-Medium
+**Recommendation**: Use Beads for all artifact tracking, not SAI indexing
 
 ---
 
