@@ -58,7 +58,7 @@ func NewMailboxBeads(identity, workDir string) *Mailbox {
 func NewMailboxFromAddress(address, workDir string) *Mailbox {
 	beadsDir := beads.ResolveBeadsDir(workDir)
 	return &Mailbox{
-		identity: addressToIdentity(address),
+		identity: AddressToIdentity(address),
 		workDir:  workDir,
 		beadsDir: beadsDir,
 		legacy:   false,
@@ -68,7 +68,7 @@ func NewMailboxFromAddress(address, workDir string) *Mailbox {
 // NewMailboxWithBeadsDir creates a mailbox with an explicit beads directory.
 func NewMailboxWithBeadsDir(address, workDir, beadsDir string) *Mailbox {
 	return &Mailbox{
-		identity: addressToIdentity(address),
+		identity: AddressToIdentity(address),
 		workDir:  workDir,
 		beadsDir: beadsDir,
 		legacy:   false,

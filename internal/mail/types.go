@@ -310,23 +310,19 @@ func ParseMessageType(s string) MessageType {
 	}
 }
 
-// addressToIdentity converts a GGT address to a beads identity.
+// AddressToIdentity converts a mail address to a beads identity.
+// This is used when storing mail as beads and when querying mailboxes.
 //
-// Liberal normalization: accepts multiple address formats and normalizes
-// to canonical form (Postel's Law - be liberal in what you accept).
-//
-// Addresses use slash format:
+// Liberal normalization (Postel's Law - be liberal in what you accept):
 //   - "overseer" → "overseer" (human operator, no trailing slash)
-//   - "mayor/" → "mayor/"
-//   - "mayor" → "mayor/"
-//   - "deacon/" → "deacon/"
-//   - "deacon" → "deacon/"
+//   - "mayor" or "mayor/" → "mayor/" (trailing slash for town-level)
+//   - "deacon" or "deacon/" → "deacon/" (trailing slash for town-level)
 //   - "gastown/polecats/Toast" → "gastown/Toast" (normalized)
 //   - "gastown/crew/max" → "gastown/max" (normalized)
 //   - "gastown/Toast" → "gastown/Toast" (already canonical)
 //   - "gastown/refinery" → "gastown/refinery"
 //   - "gastown/" → "gastown" (rig broadcast)
-func addressToIdentity(address string) string {
+func AddressToIdentity(address string) string {
 	// Overseer (human operator) - no trailing slash, distinct from agents
 	if address == "overseer" {
 		return "overseer"

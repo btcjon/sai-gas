@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -522,6 +523,10 @@ func sendHandoffMail(subject, message string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("detecting agent identity: %w", err)
 	}
+
+	// Normalize agent identity to match mail router format.
+	// resolveSelfTarget() returns "mayor" but mailbox queries expect "mayor/"
+	agentID = mail.AddressToIdentity(agentID)
 
 	// Detect town root for beads location
 	townRoot := detectTownRootFromCwd()
