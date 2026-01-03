@@ -39,6 +39,8 @@ var (
 	convoyListAll        bool
 	convoyListTree       bool
 	convoyInteractive    bool
+	convoyMergeNew       string
+	convoyMergeTitle     string
 )
 
 var convoyCmd = &cobra.Command{
@@ -179,6 +181,24 @@ Examples:
 	RunE: runConvoyFeed,
 }
 
+var convoyMergeCmd = &cobra.Command{
+	Use:   "merge <target-convoy> <source-convoys...>",
+	Short: "Merge multiple convoys into one",
+	Long: `Consolidate multiple convoys into a single convoy.
+
+All tracked issues from source convoys are added to the target convoy,
+and source convoys are closed with a note indicating they were merged.
+
+Use --new to create a fresh target convoy instead of merging into an existing one.
+
+Examples:
+  gt convoy merge hq-cv-target hq-cv-1 hq-cv-2 hq-cv-3
+  gt convoy merge hq-cv-target hq-cv-1 hq-cv-2 --title "Combined Work"
+  gt convoy merge --new "Mail CLI Implementation" hq-cv-1 hq-cv-2 hq-cv-3`,
+	Args: cobra.MinimumNArgs(1),
+	RunE: runConvoyMerge,
+}
+
 func init() {
 	// Create flags
 	convoyCreateCmd.Flags().StringVar(&convoyMolecule, "molecule", "", "Associated molecule ID")
@@ -204,12 +224,17 @@ func init() {
 	// Interactive TUI flag (on parent command)
 	convoyCmd.Flags().BoolVarP(&convoyInteractive, "interactive", "i", false, "Interactive tree view")
 
+	// Merge flags
+	convoyMergeCmd.Flags().StringVar(&convoyMergeNew, "new", "", "Create a new target convoy with this name instead of using an existing one")
+	convoyMergeCmd.Flags().StringVar(&convoyMergeTitle, "title", "", "Update target convoy title after merge")
+
 	// Add subcommands
 	convoyCmd.AddCommand(convoyCreateCmd)
 	convoyCmd.AddCommand(convoyStatusCmd)
 	convoyCmd.AddCommand(convoyListCmd)
 	convoyCmd.AddCommand(convoyAddCmd)
 	convoyCmd.AddCommand(convoyFeedCmd)
+	convoyCmd.AddCommand(convoyMergeCmd)
 
 	rootCmd.AddCommand(convoyCmd)
 }
@@ -1181,6 +1206,138 @@ func runConvoyFeed(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  ✗ %s\n", e)
 		}
 	}
+
+	return nil
+}
+
+// runConvoyMerge consolidates multiple convoys into one.
+func runConvoyMerge(cmd *cobra.Command, args []string) error {
+	townBeads, err := getTownBeadsDir()
+	if err != nil {
+		return err
+	}
+
+	var targetConvoyID string
+	var sourceConvoyIDs []string
+
+	// Determine mode: --new creates fresh target, otherwise first arg is target
+	if convoyMergeNew != "" {
+		// All args are source convoys; create a new target
+		sourceConvoyIDs = args
+		if len(sourceConvoyIDs) == 0 {
+			return fmt.Errorf("no source convoys specified")
+		}
+
+		// Create new convoy (no initial issues - we'll add them via merge)
+		newConvoyID := fmt.Sprintf("hq-cv-%s", generateShortID())
+		description := fmt.Sprintf("Merged convoy from %d source(s)", len(sourceConvoyIDs))
+
+		createArgs := []string{
+			"create",
+			"--type=convoy",
+			"--id=" + newConvoyID,
+			"--title=" + convoyMergeNew,
+			"--description=" + description,
+		}
+
+		createCmd := exec.Command("bd", createArgs...)
+		createCmd.Dir = townBeads
+		var stderr bytes.Buffer
+		createCmd.Stderr = &stderr
+
+		if err := createCmd.Run(); err != nil {
+			return fmt.Errorf("creating new convoy: %w (%s)", err, strings.TrimSpace(stderr.String()))
+		}
+
+		targetConvoyID = newConvoyID
+		fmt.Printf("%s Created new convoy 🚚 %s: %s\n\n", style.Bold.Render("✓"), newConvoyID, convoyMergeNew)
+	} else {
+		// First arg is target, rest are sources
+		if len(args) < 2 {
+			return fmt.Errorf("need at least one target and one source convoy")
+		}
+		targetConvoyID = args[0]
+		sourceConvoyIDs = args[1:]
+
+		// Validate target convoy exists
+		showCmd := exec.Command("bd", "show", targetConvoyID, "--json")
+		showCmd.Dir = townBeads
+		var stdout bytes.Buffer
+		showCmd.Stdout = &stdout
+		if err := showCmd.Run(); err != nil {
+			return fmt.Errorf("target convoy '%s' not found", targetConvoyID)
+		}
+
+		var convoys []struct {
+			ID     string `json:"id"`
+			Title  string `json:"title"`
+			Type   string `json:"issue_type"`
+			Status string `json:"status"`
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil || len(convoys) == 0 {
+			return fmt.Errorf("target convoy '%s' not found", targetConvoyID)
+		}
+		if convoys[0].Type != "convoy" {
+			return fmt.Errorf("'%s' is not a convoy (type: %s)", targetConvoyID, convoys[0].Type)
+		}
+
+		// Reopen target if closed
+		if convoys[0].Status == "closed" {
+			reopenArgs := []string{"update", targetConvoyID, "--status=open"}
+			reopenCmd := exec.Command("bd", reopenArgs...)
+			reopenCmd.Dir = townBeads
+			if err := reopenCmd.Run(); err != nil {
+				return fmt.Errorf("couldn't reopen target convoy: %w", err)
+			}
+			fmt.Printf("%s Reopened target convoy %s\n", style.Bold.Render("↺"), targetConvoyID)
+		}
+	}
+
+	fmt.Printf("Merging %d convoy(s) into %s...\n", len(sourceConvoyIDs), targetConvoyID)
+
+	totalMerged := 0
+	for _, sourceID := range sourceConvoyIDs {
+		// Get tracked issues from source convoy
+		tracked := getTrackedIssues(townBeads, sourceID)
+
+		if len(tracked) == 0 {
+			fmt.Printf("  ← %s: 0 issues (empty)\n", sourceID)
+		} else {
+			// Add each tracked issue to target convoy
+			mergedCount := 0
+			for _, issue := range tracked {
+				depArgs := []string{"dep", "add", targetConvoyID, issue.ID, "--type=tracks"}
+				depCmd := exec.Command("bd", depArgs...)
+				depCmd.Dir = townBeads
+				if err := depCmd.Run(); err == nil {
+					mergedCount++
+				}
+			}
+			fmt.Printf("  ← %s: %d issue(s) merged\n", sourceID, mergedCount)
+			totalMerged += mergedCount
+		}
+
+		// Close source convoy with merge note
+		closeNote := fmt.Sprintf("Merged into %s", targetConvoyID)
+		closeArgs := []string{"close", sourceID, "-m", closeNote}
+		closeCmd := exec.Command("bd", closeArgs...)
+		closeCmd.Dir = townBeads
+		if err := closeCmd.Run(); err != nil {
+			style.PrintWarning("couldn't close source convoy %s: %v", sourceID, err)
+		}
+	}
+
+	// Update target title if --title flag provided
+	if convoyMergeTitle != "" {
+		updateArgs := []string{"update", targetConvoyID, "--title=" + convoyMergeTitle}
+		updateCmd := exec.Command("bd", updateArgs...)
+		updateCmd.Dir = townBeads
+		if err := updateCmd.Run(); err != nil {
+			style.PrintWarning("couldn't update title: %v", err)
+		}
+	}
+
+	fmt.Printf("%s Merged %d issue(s) into %s\n", style.Bold.Render("✓"), totalMerged, targetConvoyID)
 
 	return nil
 }
