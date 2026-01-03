@@ -535,11 +535,16 @@ func (e *Engineer) handleFailureFromQueue(mr *mrqueue.MR, result ProcessResult) 
 //   Priority: inherit from original + boost (P2 -> P1)
 //   Parent: original MR bead
 //   Description: metadata including branch, conflict SHA, etc.
+//
+// Also updates the MR with conflict metadata:
+//   - RetryCount: incremented for each conflict
+//   - LastConflictSHA: SHA of target branch when conflict occurred
+//   - ConflictTaskID: ID of the created conflict-resolution task
 func (e *Engineer) createConflictResolutionTask(mr *mrqueue.MR, result ProcessResult) error {
-	// Get the current main SHA for conflict tracking
-	mainSHA, err := e.git.Rev("origin/" + mr.Target)
+	// Get the current target branch SHA for conflict tracking
+	targetSHA, err := e.git.Rev("origin/" + mr.Target)
 	if err != nil {
-		mainSHA = "unknown-sha"
+		targetSHA = "unknown-sha"
 	}
 
 	// Get the original issue title if we have a source issue
@@ -582,7 +587,7 @@ The Refinery will automatically retry the merge after you force-push.`,
 		mr.Branch,
 		mr.ID,
 		mr.Branch,
-		mr.Target, mainSHA[:8],
+		mr.Target, targetSHA[:8],
 		mr.SourceIssue,
 		retryCount,
 		mr.Branch,
@@ -602,14 +607,18 @@ The Refinery will automatically retry the merge after you force-push.`,
 		return fmt.Errorf("creating conflict resolution task: %w", err)
 	}
 
-	// Add dependency: the conflict task depends on nothing, but the MR depends on the task
-	// Note: We don't add the task as parent of the MR since MRs are ephemeral in the queue
-	// The task itself serves as the dispatchable work unit
-
 	fmt.Fprintf(e.output, "[Engineer] Created conflict resolution task: %s (P%d)\n", task.ID, task.Priority)
 
-	// Update the MR's retry count for priority scoring
+	// Update the MR with conflict metadata
 	mr.RetryCount = retryCount
+	mr.LastConflictSHA = targetSHA
+	mr.ConflictTaskID = task.ID
+
+	// Persist the updated MR to the queue
+	if err := e.mrQueue.Update(mr); err != nil {
+		fmt.Fprintf(e.output, "[Engineer] Warning: failed to persist MR conflict metadata: %v\n", err)
+		// Don't return error - the task was created successfully
+	}
 
 	return nil
 }

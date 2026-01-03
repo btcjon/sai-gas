@@ -33,6 +33,10 @@ type MR struct {
 	ConvoyID        string     `json:"convoy_id,omitempty"`         // Parent convoy ID if part of a convoy
 	ConvoyCreatedAt *time.Time `json:"convoy_created_at,omitempty"` // Convoy creation time for starvation prevention
 
+	// Conflict tracking fields
+	LastConflictSHA string `json:"last_conflict_sha,omitempty"` // SHA of target branch when conflict occurred
+	ConflictTaskID  string `json:"conflict_task_id,omitempty"`  // Bead ID of conflict-resolution task (if any)
+
 	// Claiming fields for parallel refinery workers
 	ClaimedBy string     `json:"claimed_by,omitempty"` // Worker ID that claimed this MR
 	ClaimedAt *time.Time `json:"claimed_at,omitempty"` // When the MR was claimed
@@ -207,6 +211,38 @@ func (q *Queue) Remove(id string) error {
 		return nil // Already removed
 	}
 	return err
+}
+
+// Update persists changes to an existing MR in the queue.
+// Returns ErrNotFound if the MR doesn't exist.
+func (q *Queue) Update(mr *MR) error {
+	path := filepath.Join(q.dir, mr.ID+".json")
+
+	// Check if MR exists
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("checking MR file: %w", err)
+	}
+
+	// Marshal and write atomically
+	data, err := json.MarshalIndent(mr, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling MR: %w", err)
+	}
+
+	// Write to temp file first, then rename (atomic on most filesystems)
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return fmt.Errorf("writing temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath) // cleanup
+		return fmt.Errorf("renaming temp file: %w", err)
+	}
+
+	return nil
 }
 
 // Count returns the number of pending MRs.
