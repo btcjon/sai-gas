@@ -1,4 +1,4 @@
-# SAI Capabilities to Port to Gas Town
+# SAI Capabilities in Gas Town
 
 > Extracted from sai-vs-gastown.md analysis
 > Last updated: 2026-01-03
@@ -7,120 +7,49 @@
 
 SAI operates at the **Claude Code layer** (hooks, skills, memory) while Gas Town operates at the **orchestration layer** (tmux, workers, supervision). These capabilities can enhance each CC instance spawned by Gas Town.
 
+### How Gas Town Interacts with SAI Hooks
+
+**Gas Town automatically injects `GASTOWN_MODE=1`** when spawning CC sessions (polecats, crew). This is set in `internal/config/loader.go:743`.
+
+All SAI hooks call `skipIfGastown()` at startup, which checks for this env var and exits early if set. This means:
+
+- **Mayor sessions** (direct CC in sai-gas): SAI hooks run normally
+- **gt-spawned sessions** (polecats/crew): SAI hooks skip, vanilla CC behavior
+
 ### Status Key
 
 | Status | Meaning |
 |--------|---------|
-| **NATIVE** | Already works via global `~/.claude/` scope |
-| **ENABLED** | Works but requires `GASTOWN_ENABLE_*` env var |
-| **TODO** | Needs implementation work |
+| **NATIVE** | Works via global `~/.claude/` scope, no hook needed |
+| **SKIPPED** | Hook exists but self-skips when GASTOWN_MODE=1 |
+| **GT-NATIVE** | Handled by Gas Town, not SAI |
 
 ---
 
 ## Quick Status Summary
 
-| Capability | Status | Enable With |
-|------------|--------|-------------|
-| Hook system (7 events) | NATIVE | (auto, but most skip in sai-gas) |
-| Skill system (159+) | NATIVE | `Skill("name")` |
-| Specialized agents (18) | NATIVE | `Task(subagent_type="...")` |
-| mem0 memory | NATIVE | (auto) |
-| CLI workers (gemini/codex/zcc) | NATIVE | Just use commands |
-| Usage-aware routing | ENABLED | `GASTOWN_ENABLE_USAGE=1` |
-| Multi-model routing | ENABLED | See `docs/multi-model-routing.md` |
-| Watcher (self-improve) | TODO | Port as Deacon dog |
-| Artifact indexing | SUPERSEDED | Use Beads instead |
+| Capability | Status | Notes |
+|------------|--------|-------|
+| Skill system (161+) | NATIVE | `~/.claude/skills/` always available |
+| CLI workers (gemini/codex/zcc) | NATIVE | In PATH, always available |
+| Specialized agents (20+) | NATIVE | `Task(subagent_type="...")` works |
+| mem0 memory hooks | SKIPPED | skipIfGastown() in all memory hooks |
+| Usage-aware routing | SKIPPED | skipIfGastown() unless GASTOWN_ENABLE_USAGE=1 |
+| Continuity hooks | SKIPPED | Beads replaces this in gt context |
+| Ralph loops | SKIPPED | GT Witness replaces this |
+| Artifact indexing | GT-NATIVE | Beads handles this |
 
 ---
 
-## Priority 1: High Value, Clear Integration Path
+## Always Available (NATIVE)
 
-### 1. Multi-Model Routing ✅ ENABLED
+These work in any CC session because they don't depend on hooks:
 
-**Status**: Available via CLI workers. See `docs/multi-model-routing.md` for full guide.
+### 1. Skill System (161+ Skills)
 
-**What it does**: Routes tasks to different AI models based on task type and usage limits.
-
-| Task Type | Model | Command |
-|-----------|-------|---------|
-| Research | Gemini Flash | `gemini -y "query" 2>/dev/null` |
-| Implementation | Claude Opus | native CC |
-| Planning | Codex | `codex gpt-5.2-codex "..."` |
-| Simple tasks | Haiku | `zcc -p "task"` |
-
-**Value**: HIGH - Gemini is ~10x cheaper than Opus
-
----
-
-### 2. Persistent Memory (mem0) ✅ NATIVE
-
-**Status**: Works automatically via global `~/.claude/` hooks.
-
-**What it does**: Vector + keyword search across sessions. Agents recall past discoveries.
-
-**Examples**:
-- "API rate limit is 100/min" - stored once, recalled forever
-- "User prefers tabs over spaces" - remembered
-- "Project uses pnpm not npm" - won't make same mistake twice
-
-**Enable explicitly**: `GASTOWN_ENABLE_MEMORY=1`
-
-**Value**: HIGH - eliminates repetitive re-learning
-
----
-
-### 3. Hook System (7 Event Types) ✅ NATIVE (selective)
-
-**Status**: Global hooks exist but most skip in sai-gas via `isGastownMode()` check.
-
-**What it does**: Intercepts CC lifecycle events and injects custom behavior.
-
-| Event | Use Case | Status in sai-gas |
-|-------|----------|-------------------|
-| `SessionStart` | Load context, check pending work | Runs (gt prime) |
-| `UserPromptSubmit` | Pre-process user input, load skills | Runs (mail check) |
-| `PreToolUse` | Block dangerous operations | Skipped |
-| `PostToolUse` | Auto-index artifacts, trigger side-effects | Skipped |
-| `Stop` | Verify completion, run gates | Skipped (Ralph) |
-| `SubagentStop` | Capture subagent results | Skipped |
-| `SessionEnd` | Cleanup, sync state | Skipped |
-
-**Enable specific hooks**: Use `GASTOWN_ENABLE_*` env vars
-
-**Value**: HIGH - enables all other capabilities
-
----
-
-## Priority 2: Medium Value, Moderate Effort
-
-### 4. Usage-Aware Routing ✅ ENABLED
-
-**Status**: Enable with `GASTOWN_ENABLE_USAGE=1`
-
-**What it does**: Tracks context usage. At 50%+ capacity, routes to CLI workers instead of subagents to preserve context.
-
-```
-Context 0-25%:  Use Opus subagents freely
-Context 25-50%: Warning, start delegating more
-Context 50-70%: Use CLI workers (gemini, codex)
-Context 70%+:   Auto-reload, continue from ledger
-```
-
-**State file**: `~/.claude/state/session-tool-usage.json`
-
-**Value**: Medium - extends session lifetime
-
----
-
-### 5. Skill System (159+ Skills) ✅ NATIVE
-
-**Status**: Works automatically via global `~/.claude/skills/`
-
-**What it does**: Specialized execution contexts loaded on-demand.
+**Works via**: Global `~/.claude/skills/` directory
 
 **Usage**: `Skill("skill-name")` or `/skill-name`
-
-**Essential skills available**:
 
 | Skill | Purpose |
 |-------|---------|
@@ -132,52 +61,28 @@ Context 70%+:   Auto-reload, continue from ledger
 | `cloudflare-services` | Deploy to Cloudflare |
 | `aws-services` | AWS operations |
 
-**Value**: Medium - ready-made solutions
-
 ---
 
-### 6. Watcher (Self-Improvement) ⏳ TODO
+### 2. CLI Workers
 
-**Status**: Needs porting as Deacon dog
+**Works via**: Executables in PATH
 
-**What it does**: Background job analyzes sessions, detects patterns, suggests improvements.
-
-**Outputs**:
-- New skill suggestions with implementation plans
-- Rule violations detected
-- Performance bottlenecks identified
-- Common patterns that should become skills
-
-**Integration point**: As Deacon dog or scheduled job
-
-**Value**: Medium-High - infrastructure evolves automatically
-
----
-
-### 7. Agent Memory Context
-
-**What it does**: Agents automatically recall relevant memories from past sessions.
-
-```typescript
-// On session start, query mem0 for relevant context
-const memories = await mem0.search(currentTask);
-// Inject into system prompt
+```bash
+gemini -y "research API endpoints" 2>/dev/null  # Gemini Flash
+codex gpt-5.2-codex "plan implementation"        # GPT-5.2 Codex
+zcc -p "quick task"                              # Claude Haiku via zai
 ```
 
-**Integration point**: SessionStart hook
-
-**Effort**: Medium
-**Value**: Medium - reduces re-discovery
+**Paths**:
+- `gemini` → `/home/dev/.npm-global/bin/gemini`
+- `codex` → `/home/dev/.npm-global/bin/codex`
+- `zcc` → `/home/dev/.claude/scripts/zcc`
 
 ---
 
-## Priority 3: Nice to Have
+### 3. Specialized Task Agents (20+ Types)
 
-### 8. Specialized Task Agents (18 Types) ✅ NATIVE
-
-**Status**: Works via `Task(subagent_type="...")` tool
-
-**What it does**: Pre-configured agents for specific domains.
+**Works via**: `Task(subagent_type="...")` tool
 
 | Agent Type | Specialty |
 |------------|-----------|
@@ -187,125 +92,152 @@ const memories = await mem0.search(currentTask);
 | `apex-copywriter` | Marketing copy |
 | `research-agent` | Deep research |
 | `docs-manager` | Documentation |
+| `gmail-manager` | Email operations |
+| `google-ads-manager` | PPC optimization |
+| `landing-page-architect` | Conversion design |
+| `nbp-imagen` | AI image generation |
 
-**Usage**: `Task(subagent_type="frontend-developer", prompt="...")`
-
-**Value**: Medium - domain expertise out of the box
-
----
-
-### 9. Ralph Loops (Iterative Verification) ⏸️ SKIPPED
-
-**Status**: Disabled in sai-gas - Gas Town's Witness is superior
-
-**What it does**: Runs N iterations checking completion gates before allowing stop.
-
-**Gates checked**:
-- Tests pass
-- No errors in output
-- Todos completed
-- Verification evidence present
-
-**Recommendation**: Use Gas Town's Witness pattern instead (external verification > self-check)
-
-**Value**: Low-Medium (Witness is better)
+Full list in `~/.claude/agents/`
 
 ---
 
-### 10. Artifact Indexing ⏸️ SUPERSEDED
+## Skipped in Gas Town (SKIPPED)
 
-**Status**: Beads handles this better
+These hooks exist but self-skip when gt spawns sessions:
 
-**What it does**: PostToolUse hook indexes created files for full-text search.
+### 4. Memory System (mem0)
 
-**Why Beads is better**:
-- Already queryable via `bd list`, `bd show`, SQLite
-- Already git-synced
-- No separate index to maintain
-- Native search: `sqlite3 .beads/beads.db "SELECT * FROM issues WHERE title LIKE '%query%'"`
+**Hooks affected**: `memory-context-loader.ts`, `memory-posttool-capture.ts`, `session-memory-capture.ts`
 
-**Recommendation**: Use Beads for all artifact tracking, not SAI indexing
+**Why skipped**: Polecats are ephemeral. Memory is valuable for long-lived workers, not single-task polecats.
+
+**Could enable with**: `GASTOWN_ENABLE_MEMORY=1` (mechanism exists, not wired up)
 
 ---
 
-### 11. CLI Workers (gemini, codex, zcc) ✅ NATIVE
+### 5. Usage-Aware Routing
 
-**Status**: Already available in PATH
+**Hook affected**: `cumulative-usage-tracker.ts`, `usage-aware-router.ts`
 
-**What it does**: Command-line wrappers for external AI models.
+**What it does**: Tracks context usage, routes to cheaper models at high usage.
 
-```bash
-gemini -y "research API endpoints" 2>/dev/null
-codex gpt-5.2-codex "plan implementation"
-zcc -p "quick task"
+**Enable with**: `GASTOWN_ENABLE_USAGE=1` (this one IS wired up)
+
+---
+
+### 6. Continuity Hooks
+
+**Hooks affected**: `continuity-session-start.ts`, `continuity-session-end.ts`, `continuity-precompact.ts`
+
+**Why skipped**: Gas Town uses Beads for continuity, not SAI ledgers.
+
+---
+
+### 7. Ralph Loops
+
+**Hooks affected**: `auto-ralph-init.ts`, `enhanced-ralph-stop.ts`
+
+**Why skipped**: Gas Town's Witness provides superior external verification.
+
+---
+
+## Handled by Gas Town (GT-NATIVE)
+
+These are replaced by Gas Town systems:
+
+| SAI Feature | Gas Town Equivalent | Why GT is Better |
+|-------------|---------------------|------------------|
+| Ledgers | Beads | Queryable, Git-synced, SQLite |
+| TodoWrite | Molecules | Survive crashes, multi-agent |
+| Ralph self-check | Witness | External verification |
+| Manual merges | Refinery | Automated conflict resolution |
+
+---
+
+## Hook Compatibility Reference
+
+### Would Work (if skipIfGastown removed)
+
+| Hook | Purpose | Uses Beads |
+|------|---------|------------|
+| session-start.sh | Skills list, delegation reminder | N/A |
+| continuity-session-start.ts | Show available beads | Yes |
+| reload-resume.ts | Hot-reload context injection | Yes |
+| pre-clear-gate.ts | Block /clear without bead bound | Yes |
+| continuity-precompact.ts | Auto-reload at 70% | Yes |
+| continuity-session-end.ts | Session summary to bead | Yes |
+| skill-activation-prompt.ts | Skill loading hints | N/A |
+| verification-enforcer.ts | Verify work before stop | N/A |
+| session-memory-capture.ts | mem0 persistence | N/A |
+| session-outcome.ts | Track outcomes | N/A |
+| usage-aware-router.ts | Cost gating | N/A |
+| subagent-stop-continuity.ts | Agent logging | N/A |
+| cumulative-usage-tracker.ts | Usage tracking | N/A |
+| agent-auto-suggest.ts | Helpful suggestions | N/A |
+| post-tool-use-tracker.ts | Tool tracking | N/A |
+| typescript-preflight.ts | TS error checks | N/A |
+| watcher-snapshot.ts | Watcher state | N/A |
+
+### Would NOT Work (SAI-specific systems)
+
+| Hook | Why Incompatible |
+|------|------------------|
+| workflow-initializer.ts | AWID workflow - GT has molecules |
+| workflow-progress.ts | AWID workflow - GT has molecules |
+| auto-ralph-init.ts | Ralph loops - GT has polecats |
+| enhanced-ralph-stop.ts | Ralph loops - GT has polecats |
+| idle-detector.ts | Queue manager - GT has witness/deacon |
+| self-improvement.ts | SAI handoffs dir structure |
+
+---
+
+## Project Settings Note
+
+The project `.claude/settings.json` contains:
+
+```json
+{
+  "env": {
+    "DISABLE_WORKFLOW_HOOKS": "1",
+    "RALPH_DISABLED": "1"
+  }
+}
 ```
 
-**Paths**:
-- `gemini` → `/home/dev/.npm-global/bin/gemini`
-- `codex` → `/home/dev/.npm-global/bin/codex`
-- `zcc` → `/home/dev/.claude/scripts/zcc`
-
-**Value**: Medium - enables multi-model
+**These are now redundant** since gt auto-injects `GASTOWN_MODE=1` which triggers `skipIfGastown()` in all hooks. The project settings were created before the gastown detection was fully implemented.
 
 ---
 
-## Not Recommended to Port
+## Enabling SAI Features in Gas Town
 
-These SAI features are superseded by Gas Town equivalents:
+The `~/.claude/hooks/lib/gastown-check.ts` supports feature flags:
 
-| SAI Feature | Gas Town Equivalent | Reason |
-|-------------|---------------------|--------|
-| Ledgers | Beads | Beads are queryable, Git-synced |
-| TodoWrite | Molecules | Molecules survive crashes |
-| Hook-based GUPP | Native GUPP | Gas Town's is more complete |
-| Manual merges | Refinery | Refinery handles conflicts |
-
----
-
-## Implementation Roadmap
-
-### Phase 1: Core Integration (Week 1)
-1. Copy hook system to `.claude/hooks/`
-2. Copy essential skills to `.claude/skills/`
-3. Merge AGENTS.md with SAI prompting
-4. Test single polecat with enhancements
-
-### Phase 2: Multi-Model (Week 2-3)
-1. Add model routing to polecat config
-2. Configure bead metadata for model selection
-3. Test gemini/codex for research tasks
-
-### Phase 3: Memory (Week 4-6)
-1. Integrate mem0 for Crew workers
-2. Configure polecats as read-only
-3. Add memory recall to SessionStart
-
-### Phase 4: Watcher (Week 7-8)
-1. Port watcher as Deacon dog
-2. Configure session analysis
-3. Auto-generate formula suggestions
-
----
-
-## Quick Reference: Files to Copy
-
+```typescript
+GASTOWN_ENABLE_MEMORY=1     // Enable mem0 even in Gastown mode
+GASTOWN_ENABLE_MULTIMODEL=1 // Enable multi-model routing
+GASTOWN_ENABLE_SKILLS=1     // Enable skill system (already native)
+GASTOWN_ENABLE_USAGE=1      // Enable usage tracking
 ```
-# From SAI to sai-gas
-~/.claude/hooks/              → .claude/hooks/
-~/.claude/skills/             → .claude/skills/ (subset)
-~/.claude/agents/             → .claude/agents/
-~/.claude/rules/              → .claude/rules/
-~/.claude/lib/                → .claude/lib/ (for mem0)
-~/.claude/settings.json       → .claude/settings.json (merge)
-```
+
+**Current implementation**: Only `GASTOWN_ENABLE_USAGE` is actually checked by any hook. The others exist in the API but no hooks use them yet.
+
+To enable: Add to rig config or set in gt spawn environment.
 
 ---
 
 ## Success Metrics
 
-| Metric | Current (Gas Town) | Target (SAI-enhanced) |
-|--------|-------------------|----------------------|
-| Cost per task | $X (Opus only) | $X/3 (multi-model) |
+| Metric | Current (vanilla GT) | With SAI features |
+|--------|---------------------|-------------------|
+| Cost per task | Opus only | Multi-model (~3x cheaper) |
 | Re-learning rate | High | Low (memory) |
-| Stuck agent recovery | Manual | Auto (hooks + witness) |
 | Pattern→skill time | Manual | Auto (watcher) |
+
+---
+
+## Future Integration Options
+
+1. **Enable mem0 for Crew** (persistent workers benefit from memory)
+2. **Wire up GASTOWN_ENABLE_MEMORY** in memory hooks
+3. **Port Watcher as Deacon dog** for self-improvement
+4. **Remove redundant project settings.json overrides**
