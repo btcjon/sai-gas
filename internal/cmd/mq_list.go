@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -59,8 +60,12 @@ func runMQList(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Apply additional filters
-	var filtered []*beads.Issue
+	// Apply additional filters and calculate scores
+	type scoredIssue struct {
+		issue *beads.Issue
+		score float64
+	}
+	var scored []scoredIssue
 	for _, issue := range issues {
 		// Parse MR fields
 		fields := beads.ParseMRFields(issue)
@@ -88,7 +93,36 @@ func runMQList(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		filtered = append(filtered, issue)
+		// Calculate score
+		var retryCount int
+		var convoyCreatedAt string
+		if fields != nil {
+			retryCount = fields.RetryCount
+			// TODO: Look up convoy created_at from convoy bead if ConvoyID is set
+			// For now, convoy age is 0 (no starvation prevention until convoy lookup is implemented)
+			_ = fields.ConvoyID // Suppress unused warning
+		}
+
+		scoreInput := beads.MRScoreInput{
+			Priority:        issue.Priority,
+			CreatedAt:       issue.CreatedAt,
+			ConvoyCreatedAt: convoyCreatedAt,
+			RetryCount:      retryCount,
+		}
+		score := beads.ScoreMRIssueWithDefaults(scoreInput)
+
+		scored = append(scored, scoredIssue{issue: issue, score: score})
+	}
+
+	// Sort by score descending (highest priority first)
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
+
+	// Extract filtered issues for JSON output
+	filtered := make([]*beads.Issue, len(scored))
+	for i, s := range scored {
+		filtered[i] = s.issue
 	}
 
 	// JSON output
@@ -97,56 +131,41 @@ func runMQList(cmd *cobra.Command, args []string) error {
 	}
 
 	// Human-readable output
-	fmt.Printf("%s Merge queue for '%s':\n\n", style.Bold.Render("📋"), rigName)
+	fmt.Printf("%s Merge queue for '%s':\n\n", style.Bold.Render("MQ"), rigName)
 
-	if len(filtered) == 0 {
+	if len(scored) == 0 {
 		fmt.Printf("  %s\n", style.Dim.Render("(empty)"))
 		return nil
 	}
 
-	// Create styled table
+	// Create styled table with SCORE and CONVOY columns
 	table := style.NewTable(
 		style.Column{Name: "ID", Width: 12},
-		style.Column{Name: "STATUS", Width: 12},
+		style.Column{Name: "SCORE", Width: 7, Align: style.AlignRight},
 		style.Column{Name: "PRI", Width: 4},
-		style.Column{Name: "BRANCH", Width: 28},
-		style.Column{Name: "WORKER", Width: 10},
+		style.Column{Name: "CONVOY", Width: 12},
+		style.Column{Name: "BRANCH", Width: 26},
 		style.Column{Name: "AGE", Width: 6, Align: style.AlignRight},
 	)
 
 	// Add rows
-	for _, issue := range filtered {
+	for _, s := range scored {
+		issue := s.issue
 		fields := beads.ParseMRFields(issue)
 
-		// Determine display status
-		displayStatus := issue.Status
-		if issue.Status == "open" {
-			if len(issue.BlockedBy) > 0 || issue.BlockedByCount > 0 {
-				displayStatus = "blocked"
-			} else {
-				displayStatus = "ready"
+		// Get convoy info
+		convoy := "(none)"
+		if fields != nil && fields.ConvoyID != "" {
+			convoy = fields.ConvoyID
+			if len(convoy) > 12 {
+				convoy = convoy[:12]
 			}
-		}
-
-		// Format status with styling
-		styledStatus := displayStatus
-		switch displayStatus {
-		case "ready":
-			styledStatus = style.Success.Render("ready")
-		case "in_progress":
-			styledStatus = style.Warning.Render("active")
-		case "blocked":
-			styledStatus = style.Dim.Render("blocked")
-		case "closed":
-			styledStatus = style.Dim.Render("closed")
 		}
 
 		// Get MR fields
 		branch := ""
-		worker := ""
 		if fields != nil {
 			branch = fields.Branch
-			worker = fields.Worker
 		}
 
 		// Format priority with color
@@ -166,13 +185,17 @@ func runMQList(cmd *cobra.Command, args []string) error {
 			displayID = displayID[:12]
 		}
 
-		table.AddRow(displayID, styledStatus, priority, branch, worker, style.Dim.Render(age))
+		// Format score
+		scoreStr := fmt.Sprintf("%.1f", s.score)
+
+		table.AddRow(displayID, scoreStr, priority, convoy, branch, style.Dim.Render(age))
 	}
 
 	fmt.Print(table.Render())
 
 	// Show blocking details below table
-	for _, issue := range filtered {
+	for _, s := range scored {
+		issue := s.issue
 		displayStatus := issue.Status
 		if issue.Status == "open" && (len(issue.BlockedBy) > 0 || issue.BlockedByCount > 0) {
 			displayStatus = "blocked"

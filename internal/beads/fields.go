@@ -1,7 +1,11 @@
 // Package beads provides field parsing utilities for structured issue descriptions.
 package beads
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // Note: AgentFields, ParseAgentFields, FormatAgentDescription, and CreateAgentBead are in beads.go
 
@@ -165,6 +169,8 @@ type MRFields struct {
 	MergeCommit string // SHA of merge commit (set on close)
 	CloseReason string // Reason for closing: merged, rejected, conflict, superseded
 	AgentBead   string // Agent bead ID that created this MR (for traceability)
+	ConvoyID    string // Parent convoy ID if part of a convoy (for priority scoring)
+	RetryCount  int    // Conflict retry count for priority penalty
 }
 
 // ParseMRFields extracts structured merge-request fields from an issue's description.
@@ -222,6 +228,15 @@ func ParseMRFields(issue *Issue) *MRFields {
 		case "agent_bead", "agent-bead", "agentbead":
 			fields.AgentBead = value
 			hasFields = true
+		case "convoy", "convoy_id", "convoy-id", "convoyid":
+			fields.ConvoyID = value
+			hasFields = true
+		case "retry_count", "retry-count", "retrycount":
+			// Parse integer, default to 0 on error
+			var count int
+			fmt.Sscanf(value, "%d", &count)
+			fields.RetryCount = count
+			hasFields = true
 		}
 	}
 
@@ -264,6 +279,12 @@ func FormatMRFields(fields *MRFields) string {
 	if fields.AgentBead != "" {
 		lines = append(lines, "agent_bead: "+fields.AgentBead)
 	}
+	if fields.ConvoyID != "" {
+		lines = append(lines, "convoy_id: "+fields.ConvoyID)
+	}
+	if fields.RetryCount > 0 {
+		lines = append(lines, fmt.Sprintf("retry_count: %d", fields.RetryCount))
+	}
 
 	return strings.Join(lines, "\n")
 }
@@ -294,6 +315,13 @@ func SetMRFields(issue *Issue, fields *MRFields) string {
 		"agent_bead":   true,
 		"agent-bead":   true,
 		"agentbead":    true,
+		"convoy":       true,
+		"convoy_id":    true,
+		"convoy-id":    true,
+		"convoyid":     true,
+		"retry_count":  true,
+		"retry-count":  true,
+		"retrycount":   true,
 	}
 
 	// Collect non-MR lines from existing description
@@ -545,4 +573,109 @@ func ExpandRolePattern(pattern, townRoot, rig, name, role string) string {
 	result = strings.ReplaceAll(result, "{name}", name)
 	result = strings.ReplaceAll(result, "{role}", role)
 	return result
+}
+
+// MRScoreConfig contains tunable weights for MR priority scoring.
+// All weights are designed so higher scores = higher priority (process first).
+type MRScoreConfig struct {
+	BaseScore       float64 // Starting score (default: 1000)
+	ConvoyAgeWeight float64 // Points per hour of convoy age (default: 10)
+	PriorityWeight  float64 // Multiplied by (4 - priority) (default: 100)
+	RetryPenalty    float64 // Points subtracted per retry (default: 50)
+	MRAgeWeight     float64 // Points per hour since MR creation (default: 1)
+	MaxRetryPenalty float64 // Cap on retry penalty (default: 300)
+}
+
+// DefaultMRScoreConfig returns sensible defaults for MR scoring.
+func DefaultMRScoreConfig() MRScoreConfig {
+	return MRScoreConfig{
+		BaseScore:       1000.0,
+		ConvoyAgeWeight: 10.0,
+		PriorityWeight:  100.0,
+		RetryPenalty:    50.0,
+		MRAgeWeight:     1.0,
+		MaxRetryPenalty: 300.0,
+	}
+}
+
+// MRScoreInput contains the data needed to score an MR issue.
+type MRScoreInput struct {
+	Priority        int        // Issue priority (0=P0/critical, 4=P4/backlog)
+	CreatedAt       string     // ISO 8601 timestamp of MR creation
+	ConvoyCreatedAt string     // ISO 8601 timestamp of convoy creation (empty if standalone)
+	RetryCount      int        // Conflict retry count
+}
+
+// ScoreMRIssue calculates the priority score for a merge-request issue.
+// Higher scores mean higher priority (process first).
+//
+// The scoring formula:
+//
+//	score = BaseScore
+//	      + ConvoyAgeWeight * hoursOld(convoy)       // Prevent convoy starvation
+//	      + PriorityWeight * (4 - priority)          // P0=+400, P4=+0
+//	      - min(RetryPenalty * retryCount, MaxRetryPenalty)  // Prevent thrashing
+//	      + MRAgeWeight * hoursOld(MR)               // FIFO tiebreaker
+func ScoreMRIssue(input MRScoreInput, config MRScoreConfig) float64 {
+	now := time.Now()
+
+	score := config.BaseScore
+
+	// Convoy age factor: prevent starvation of old convoys
+	if input.ConvoyCreatedAt != "" {
+		if convoyTime, err := parseISOTime(input.ConvoyCreatedAt); err == nil {
+			convoyHours := now.Sub(convoyTime).Hours()
+			if convoyHours > 0 {
+				score += config.ConvoyAgeWeight * convoyHours
+			}
+		}
+	}
+
+	// Priority factor: P0 (0) gets +400, P4 (4) gets +0
+	priorityBonus := 4 - input.Priority
+	if priorityBonus < 0 {
+		priorityBonus = 0 // Clamp for invalid priorities > 4
+	}
+	if priorityBonus > 4 {
+		priorityBonus = 4 // Clamp for invalid priorities < 0
+	}
+	score += config.PriorityWeight * float64(priorityBonus)
+
+	// Retry penalty: prevent thrashing on repeatedly failing MRs
+	retryPenalty := config.RetryPenalty * float64(input.RetryCount)
+	if retryPenalty > config.MaxRetryPenalty {
+		retryPenalty = config.MaxRetryPenalty
+	}
+	score -= retryPenalty
+
+	// MR age factor: FIFO ordering as tiebreaker
+	if input.CreatedAt != "" {
+		if mrTime, err := parseISOTime(input.CreatedAt); err == nil {
+			mrHours := now.Sub(mrTime).Hours()
+			if mrHours > 0 {
+				score += config.MRAgeWeight * mrHours
+			}
+		}
+	}
+
+	return score
+}
+
+// ScoreMRIssueWithDefaults is a convenience wrapper using default config.
+func ScoreMRIssueWithDefaults(input MRScoreInput) float64 {
+	return ScoreMRIssue(input, DefaultMRScoreConfig())
+}
+
+// parseISOTime parses an ISO 8601 timestamp string.
+func parseISOTime(s string) (time.Time, error) {
+	// Try RFC3339 first (most common)
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	// Try without timezone
+	if t, err := time.Parse("2006-01-02T15:04:05", s); err == nil {
+		return t, nil
+	}
+	// Try date-only
+	return time.Parse("2006-01-02", s)
 }

@@ -122,14 +122,19 @@ var mqListCmd = &cobra.Command{
 	Short: "Show the merge queue",
 	Long: `Show the merge queue for a rig.
 
-Lists all pending merge requests waiting to be processed.
+Lists all pending merge requests sorted by priority score (highest first).
 
 Output format:
-  ID          STATUS       PRIORITY  BRANCH                    WORKER  AGE
-  gt-mr-001   ready        P0        polecat/Nux/gp-xyz        Nux     5m
-  gt-mr-002   in_progress  P1        polecat/Toast/gt-abc      Toast   12m
-  gt-mr-003   blocked      P1        polecat/Capable/gt-def    Capable 8m
-              (waiting on gt-mr-001)
+  ID          SCORE   PRI  CONVOY        BRANCH                    AGE
+  gt-mr-001   1400.0  P0   hq-cv-xyz     polecat/Nux/gp-xyz        2h
+  gt-mr-002   1310.0  P1   hq-cv-abc     polecat/Toast/gt-abc      45m
+  gt-mr-003   1200.0  P2   (none)        polecat/Capable/gt-def    10m
+
+Priority score considers:
+  - Issue priority (P0-P4)
+  - Convoy age (prevents starvation of batch work)
+  - Retry count (deprioritizes thrashing MRs)
+  - MR age (FIFO tiebreaker)
 
 Examples:
   gt mq list greenplace

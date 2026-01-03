@@ -241,6 +241,7 @@ func (m *Manager) Stop() error {
 
 // Queue returns the current merge queue.
 // Uses beads merge-request issues as the source of truth (not git branches).
+// Returns items sorted by priority score (highest first).
 func (m *Manager) Queue() ([]QueueItem, error) {
 	// Query beads for open merge-request type issues
 	// BeadsPath() returns the git-synced beads location
@@ -260,6 +261,36 @@ func (m *Manager) Queue() ([]QueueItem, error) {
 		return nil, err
 	}
 
+	// Calculate scores for all issues
+	type scoredIssue struct {
+		issue *beads.Issue
+		score float64
+	}
+	var scored []scoredIssue
+	for _, issue := range issues {
+		fields := beads.ParseMRFields(issue)
+		var retryCount int
+		var convoyCreatedAt string
+		if fields != nil {
+			retryCount = fields.RetryCount
+			// TODO: Look up convoy created_at from convoy bead if ConvoyID is set
+		}
+
+		scoreInput := beads.MRScoreInput{
+			Priority:        issue.Priority,
+			CreatedAt:       issue.CreatedAt,
+			ConvoyCreatedAt: convoyCreatedAt,
+			RetryCount:      retryCount,
+		}
+		score := beads.ScoreMRIssueWithDefaults(scoreInput)
+		scored = append(scored, scoredIssue{issue: issue, score: score})
+	}
+
+	// Sort by score descending (highest priority first)
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
+
 	// Build queue items
 	var items []QueueItem
 	pos := 1
@@ -273,14 +304,9 @@ func (m *Manager) Queue() ([]QueueItem, error) {
 		})
 	}
 
-	// Sort issues by priority (P0 first, then P1, etc.)
-	sort.Slice(issues, func(i, j int) bool {
-		return issues[i].Priority < issues[j].Priority
-	})
-
-	// Convert beads issues to queue items
-	for _, issue := range issues {
-		mr := m.issueToMR(issue)
+	// Convert scored issues to queue items
+	for _, s := range scored {
+		mr := m.issueToMR(s.issue)
 		if mr != nil {
 			// Skip if this is the currently processing MR
 			if ref.CurrentMR != nil && ref.CurrentMR.ID == mr.ID {
@@ -290,6 +316,7 @@ func (m *Manager) Queue() ([]QueueItem, error) {
 				Position: pos,
 				MR:       mr,
 				Age:      formatAge(mr.CreatedAt),
+				Score:    s.score,
 			})
 			pos++
 		}

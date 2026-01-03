@@ -149,9 +149,10 @@ func DefaultMergeConfig() MergeConfig {
 
 // QueueItem represents an item in the merge queue for display.
 type QueueItem struct {
-	Position  int       `json:"position"`
-	MR        *MergeRequest `json:"mr"`
-	Age       string    `json:"age"`
+	Position int           `json:"position"`
+	MR       *MergeRequest `json:"mr"`
+	Age      string        `json:"age"`
+	Score    float64       `json:"score,omitempty"` // Priority score (higher = process first)
 }
 
 // State transition errors.
