@@ -195,3 +195,149 @@ func (s *AgentHealthState) CooldownRemaining(cooldown time.Duration) time.Durati
 func (s *AgentHealthState) ShouldForceKill(threshold int) bool {
 	return s.ConsecutiveFailures >= threshold
 }
+
+// WatchdogDecision represents the outcome of evaluating an agent's health.
+type WatchdogDecision struct {
+	AgentID         string        `json:"agent_id"`
+	Action          string        `json:"action"` // "allow", "block", "force_kill"
+	Reason          string        `json:"reason"`
+	CircuitState    CircuitState  `json:"circuit_state"`
+	RetryAfter      time.Duration `json:"retry_after,omitempty"`
+	ConsecFailures  int           `json:"consecutive_failures"`
+	SuccessRate     float64       `json:"success_rate"`
+}
+
+// EvaluateAgent combines health check state and circuit breaker state
+// to make a decision about how to handle an agent.
+// This is the main integration point for the watchdog loop.
+func EvaluateAgent(
+	agentID string,
+	healthState *HealthCheckState,
+	cbRegistry *CircuitBreakerRegistry,
+	stuckCfg *StuckConfig,
+) *WatchdogDecision {
+	agent := healthState.GetAgentState(agentID)
+	cb := cbRegistry.GetBreaker(agentID)
+	cbCfg := cbRegistry.GetConfig()
+
+	decision := &WatchdogDecision{
+		AgentID:        agentID,
+		CircuitState:   cb.State,
+		ConsecFailures: agent.ConsecutiveFailures,
+		SuccessRate:    cb.SuccessRate(),
+	}
+
+	// Check circuit breaker first - if open, we block
+	if !cb.ShouldAllow(cbCfg) {
+		decision.Action = "block"
+		decision.Reason = "circuit breaker open"
+		decision.RetryAfter = cb.TimeUntilRetry(cbCfg)
+		return decision
+	}
+
+	// Check if in cooldown
+	if agent.IsInCooldown(stuckCfg.Cooldown) {
+		decision.Action = "block"
+		decision.Reason = "cooldown after force-kill"
+		decision.RetryAfter = agent.CooldownRemaining(stuckCfg.Cooldown)
+		return decision
+	}
+
+	// Check if should force-kill
+	if agent.ShouldForceKill(stuckCfg.ConsecutiveFailures) {
+		decision.Action = "force_kill"
+		decision.Reason = "exceeded failure threshold"
+		return decision
+	}
+
+	// Allow the operation
+	decision.Action = "allow"
+	decision.Reason = "healthy"
+	return decision
+}
+
+// RecordHealthCheckOutcome updates both health state and circuit breaker
+// based on the outcome of a health check.
+func RecordHealthCheckOutcome(
+	agentID string,
+	success bool,
+	healthState *HealthCheckState,
+	cbRegistry *CircuitBreakerRegistry,
+) (stateChanged bool) {
+	agent := healthState.GetAgentState(agentID)
+	cb := cbRegistry.GetBreaker(agentID)
+	cbCfg := cbRegistry.GetConfig()
+
+	if success {
+		agent.RecordResponse()
+		stateChanged = cb.RecordSuccess(cbCfg)
+	} else {
+		agent.RecordFailure()
+		stateChanged = cb.RecordFailure(cbCfg)
+	}
+
+	return stateChanged
+}
+
+// RecordForceKillOutcome records that a force-kill was performed.
+// Updates both health state and circuit breaker.
+func RecordForceKillOutcome(
+	agentID string,
+	healthState *HealthCheckState,
+	cbRegistry *CircuitBreakerRegistry,
+) {
+	agent := healthState.GetAgentState(agentID)
+	agent.RecordForceKill()
+
+	// A force-kill counts as a failure from the circuit breaker's perspective
+	cb := cbRegistry.GetBreaker(agentID)
+	cbCfg := cbRegistry.GetConfig()
+	cb.RecordFailure(cbCfg)
+}
+
+// WatchdogSummary provides a summary of the overall system health.
+type WatchdogSummary struct {
+	TotalAgents      int                  `json:"total_agents"`
+	HealthyAgents    int                  `json:"healthy_agents"`
+	UnhealthyAgents  int                  `json:"unhealthy_agents"`
+	CircuitStates    map[CircuitState]int `json:"circuit_states"`
+	TotalForceKills  int                  `json:"total_force_kills"`
+	AverageSuccessRate float64            `json:"average_success_rate"`
+}
+
+// GetWatchdogSummary generates a summary of current system health.
+func GetWatchdogSummary(
+	healthState *HealthCheckState,
+	cbRegistry *CircuitBreakerRegistry,
+	stuckCfg *StuckConfig,
+) *WatchdogSummary {
+	summary := &WatchdogSummary{
+		CircuitStates: cbRegistry.Summary(),
+	}
+
+	var totalSuccessRate float64
+	for agentID := range healthState.Agents {
+		summary.TotalAgents++
+		agent := healthState.Agents[agentID]
+		summary.TotalForceKills += agent.ForceKillCount
+
+		cb := cbRegistry.GetBreaker(agentID)
+		totalSuccessRate += cb.SuccessRate()
+
+		// Determine if healthy
+		decision := EvaluateAgent(agentID, healthState, cbRegistry, stuckCfg)
+		if decision.Action == "allow" {
+			summary.HealthyAgents++
+		} else {
+			summary.UnhealthyAgents++
+		}
+	}
+
+	if summary.TotalAgents > 0 {
+		summary.AverageSuccessRate = totalSuccessRate / float64(summary.TotalAgents)
+	} else {
+		summary.AverageSuccessRate = 100.0
+	}
+
+	return summary
+}
