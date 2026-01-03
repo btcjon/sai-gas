@@ -167,9 +167,36 @@ func getTownBeadsDir() (string, error) {
 	return filepath.Join(townRoot, ".beads"), nil
 }
 
+// looksLikeIssueID returns true if the string looks like a beads issue ID.
+// Issue IDs have a prefix followed by a hyphen (e.g., gt-abc, bd-xyz, hq-123).
+func looksLikeIssueID(s string) bool {
+	parts := strings.SplitN(s, "-", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	// Common prefixes: gt, bd, hq, or any 2-4 letter prefix
+	prefix := parts[0]
+	return len(prefix) >= 2 && len(prefix) <= 4 && len(parts[1]) > 0
+}
+
 func runConvoyCreate(cmd *cobra.Command, args []string) error {
 	name := args[0]
 	trackedIssues := args[1:]
+
+	// If first arg looks like an issue ID, treat all args as issues
+	// and auto-generate the convoy name from the first issue's title
+	if looksLikeIssueID(name) {
+		trackedIssues = args // All args are issues
+		// Try to get title from first issue for the convoy name
+		if details := getIssueDetails(name); details != nil && details.Title != "" {
+			name = fmt.Sprintf("Convoy: %s", details.Title)
+			if len(trackedIssues) > 1 {
+				name = fmt.Sprintf("Convoy: %s (+%d)", details.Title, len(trackedIssues)-1)
+			}
+		} else {
+			name = fmt.Sprintf("Convoy tracking %s", strings.Join(trackedIssues, ", "))
+		}
+	}
 
 	townBeads, err := getTownBeadsDir()
 	if err != nil {
@@ -394,6 +421,17 @@ func runConvoyStatus(cmd *cobra.Command, args []string) error {
 	for _, t := range tracked {
 		if t.Status == "closed" {
 			completed++
+		}
+	}
+
+	// Auto-close convoy if 100% complete and still open
+	if convoy.Status == "open" && len(tracked) > 0 && completed == len(tracked) {
+		closeArgs := []string{"close", convoyID}
+		closeCmd := exec.Command("bd", closeArgs...)
+		closeCmd.Dir = townBeads
+		if err := closeCmd.Run(); err == nil {
+			convoy.Status = "closed"
+			fmt.Printf("%s Convoy auto-closed (all %d issues complete)\n\n", style.Success.Render("✓"), completed)
 		}
 	}
 
