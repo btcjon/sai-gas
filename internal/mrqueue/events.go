@@ -22,6 +22,10 @@ const (
 	EventMergeFailed EventType = "merge_failed"
 	// EventMergeSkipped indicates an MR was skipped (already merged, etc.).
 	EventMergeSkipped EventType = "merge_skipped"
+	// EventConflictResolved indicates a polecat resolved conflicts and rebased.
+	EventConflictResolved EventType = "conflict_resolved"
+	// EventMRRequeued indicates an MR re-entered the queue after conflict resolution.
+	EventMRRequeued EventType = "mr_requeued"
 )
 
 // Event represents a single MQ lifecycle event.
@@ -143,6 +147,35 @@ func (l *EventLogger) LogMergeSkipped(mr *MR, reason string) error {
 		SourceIssue: mr.SourceIssue,
 		Rig:         mr.Rig,
 		Reason:      reason,
+	})
+}
+
+// LogConflictResolved logs a conflict_resolved event.
+func (l *EventLogger) LogConflictResolved(mr *MR, newSHA string) error {
+	return l.LogEvent(Event{
+		Type:        EventConflictResolved,
+		MRID:        mr.ID,
+		Branch:      mr.Branch,
+		Target:      mr.Target,
+		Worker:      mr.Worker,
+		SourceIssue: mr.SourceIssue,
+		Rig:         mr.Rig,
+		MergeCommit: newSHA, // Reusing field for the new HEAD SHA
+		Reason:      "conflicts resolved via rebase",
+	})
+}
+
+// LogMRRequeued logs an mr_requeued event.
+func (l *EventLogger) LogMRRequeued(mr *MR, resolvedBy string) error {
+	return l.LogEvent(Event{
+		Type:        EventMRRequeued,
+		MRID:        mr.ID,
+		Branch:      mr.Branch,
+		Target:      mr.Target,
+		Worker:      mr.Worker,
+		SourceIssue: mr.SourceIssue,
+		Rig:         mr.Rig,
+		Reason:      "re-queued after conflict resolution by " + resolvedBy,
 	})
 }
 
