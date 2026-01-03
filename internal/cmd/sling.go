@@ -22,7 +22,7 @@ import (
 )
 
 var slingCmd = &cobra.Command{
-	Use:     "sling <bead-or-formula> [target]",
+	Use:     "sling <bead-or-formula>... <target>",
 	GroupID: GroupWork,
 	Short:   "Assign work to an agent (THE unified work dispatch command)",
 	Long: `Sling work onto an agent's hook and start working immediately.
@@ -34,6 +34,7 @@ This is THE command for assigning work in Gas Town. It handles:
   - Formula instantiation and wisp creation
   - No-tmux mode for manual agent operation
   - Auto-convoy creation for dashboard visibility
+  - BATCH SLINGING: Multiple beads in one command
 
 Auto-Convoy:
   When slinging a single issue (not a formula), sling automatically creates
@@ -43,11 +44,20 @@ Auto-Convoy:
   gt sling gt-abc gastown              # Creates "Work: <issue-title>" convoy
   gt sling gt-abc gastown --no-convoy  # Skip auto-convoy creation
 
+Batch Slinging:
+  Sling multiple beads to a target, spawning a polecat for each:
+
+  gt sling gt-abc gt-def gt-ghi gastown    # Slings 3 beads, spawns 3 polecats
+  gt sling gt-abc gt-def gastown --convoy-name "Feature batch"
+
+  For batches of 2+ beads, a convoy is auto-created to track all work unless
+  --no-convoy is specified. Use --convoy-name to set a custom convoy name.
+
 Target Resolution:
   gt sling gt-abc                       # Self (current agent)
   gt sling gt-abc crew                  # Crew worker in current rig
-  gt sling gp-abc greenplace               # Auto-spawn polecat in rig
-  gt sling gt-abc greenplace/Toast         # Specific polecat
+  gt sling gp-abc greenplace            # Auto-spawn polecat in rig
+  gt sling gt-abc greenplace/Toast      # Specific polecat
   gt sling gt-abc mayor                 # Mayor
   gt sling gt-abc deacon/dogs           # Auto-dispatch to idle dog
   gt sling gt-abc deacon/dogs/alpha     # Specific dog
@@ -85,7 +95,7 @@ Compare:
   gt handoff <bead>   # Attach + restart (fresh context)
 
 The propulsion principle: if it's on your hook, YOU RUN IT.`,
-	Args: cobra.RangeArgs(1, 2),
+	Args: cobra.MinimumNArgs(1),
 	RunE: runSling,
 }
 
@@ -103,8 +113,9 @@ var (
 	slingMolecule string // --molecule: workflow to instantiate on the bead
 	slingForce    bool   // --force: force spawn even if polecat has unread mail
 	slingAccount  string // --account: Claude Code account handle to use
-	slingQuality  string // --quality: shorthand for polecat workflow (basic|shiny|chrome)
-	slingNoConvoy bool   // --no-convoy: skip auto-convoy creation
+	slingQuality    string // --quality: shorthand for polecat workflow (basic|shiny|chrome)
+	slingNoConvoy   bool   // --no-convoy: skip auto-convoy creation
+	slingConvoyName string // --convoy-name: custom name for batch convoy
 )
 
 func init() {
@@ -123,6 +134,7 @@ func init() {
 	slingCmd.Flags().StringVar(&slingAccount, "account", "", "Claude Code account handle to use")
 	slingCmd.Flags().StringVarP(&slingQuality, "quality", "q", "", "Polecat workflow quality level (basic|shiny|chrome)")
 	slingCmd.Flags().BoolVar(&slingNoConvoy, "no-convoy", false, "Skip auto-convoy creation for single-issue sling")
+	slingCmd.Flags().StringVar(&slingConvoyName, "convoy-name", "", "Custom name for batch convoy (default: 'Batch: <first-bead-title>')")
 
 	rootCmd.AddCommand(slingCmd)
 }
@@ -138,150 +150,446 @@ func runSling(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--var cannot be used with --on (formula-on-bead mode doesn't support variables)")
 	}
 
-	// --quality is shorthand for formula-on-bead with polecat workflow
-	// Convert: gt sling gp-abc greenplace --quality=shiny
-	// To:      gt sling mol-polecat-shiny --on gt-abc gastown
-	if slingQuality != "" {
-		qualityFormula, err := qualityToFormula(slingQuality)
-		if err != nil {
-			return err
-		}
-		// The first arg should be the bead, and we wrap it with the formula
-		if slingOnTarget != "" {
-			return fmt.Errorf("--quality cannot be used with --on (both specify formula)")
-		}
-		slingOnTarget = args[0]         // The bead becomes --on target
-		args[0] = qualityFormula        // The formula becomes first arg
+	// Parse args to separate beads from target
+	// Strategy: last arg might be target, all before are beads
+	// We need to detect which args are beads and which is the target
+	beadIDs, target, formulaName, err := parseSlingsArgs(args)
+	if err != nil {
+		return err
 	}
 
-	// Determine mode based on flags and argument types
-	var beadID string
-	var formulaName string
-
-	if slingOnTarget != "" {
-		// Formula-on-bead mode: gt sling <formula> --on <bead>
-		formulaName = args[0]
-		beadID = slingOnTarget
-		// Verify both exist
-		if err := verifyBeadExists(beadID); err != nil {
-			return err
-		}
-		if err := verifyFormulaExists(formulaName); err != nil {
-			return err
-		}
-	} else {
-		// Could be bead mode or standalone formula mode
-		firstArg := args[0]
-
-		// Try as bead first
-		if err := verifyBeadExists(firstArg); err == nil {
-			// It's a bead
-			beadID = firstArg
-		} else {
-			// Not a bead - try as standalone formula
-			if err := verifyFormulaExists(firstArg); err == nil {
-				// Standalone formula mode: gt sling <formula> [target]
-				return runSlingFormula(args)
-			}
-			// Neither bead nor formula
-			return fmt.Errorf("'%s' is not a valid bead or formula", firstArg)
-		}
-	}
-
-	// Determine target agent (self or specified)
-	var targetAgent string
-	var targetPane string
-	var err error
-
-	if len(args) > 1 {
-		target := args[1]
-
-		// Resolve "." to current agent identity (like git's "." meaning current directory)
-		if target == "." {
-			targetAgent, targetPane, _, err = resolveSelfTarget()
-			if err != nil {
-				return fmt.Errorf("resolving self for '.' target: %w", err)
-			}
-		} else if dogName, isDog := IsDogTarget(target); isDog {
-			if slingDryRun {
-				if dogName == "" {
-					fmt.Printf("Would dispatch to idle dog in kennel\n")
-				} else {
-					fmt.Printf("Would dispatch to dog '%s'\n", dogName)
-				}
-				targetAgent = fmt.Sprintf("deacon/dogs/%s", dogName)
-				if dogName == "" {
-					targetAgent = "deacon/dogs/<idle>"
-				}
-				targetPane = "<dog-pane>"
-			} else {
-				// Dispatch to dog
-				dispatchInfo, dispatchErr := DispatchToDog(dogName, slingCreate)
-				if dispatchErr != nil {
-					return fmt.Errorf("dispatching to dog: %w", dispatchErr)
-				}
-				targetAgent = dispatchInfo.AgentID
-				targetPane = dispatchInfo.Pane
-				fmt.Printf("Dispatched to dog %s\n", dispatchInfo.DogName)
-			}
-		} else if rigName, isRig := IsRigName(target); isRig {
-			// Check if target is a rig name (auto-spawn polecat)
-			if slingDryRun {
-				// Dry run - just indicate what would happen
-				fmt.Printf("Would spawn fresh polecat in rig '%s'\n", rigName)
-				if slingNaked {
-					fmt.Printf("  --naked: would skip tmux session\n")
-				}
-				targetAgent = fmt.Sprintf("%s/polecats/<new>", rigName)
-				targetPane = "<new-pane>"
-			} else {
-				// Spawn a fresh polecat in the rig
-				fmt.Printf("Target is rig '%s', spawning fresh polecat...\n", rigName)
-				spawnOpts := SlingSpawnOptions{
-					Force:    slingForce,
-					Naked:    slingNaked,
-					Account:  slingAccount,
-					Create:   slingCreate,
-					HookBead: beadID, // Set atomically at spawn time
-				}
-				spawnInfo, spawnErr := SpawnPolecatForSling(rigName, spawnOpts)
-				if spawnErr != nil {
-					return fmt.Errorf("spawning polecat: %w", spawnErr)
-				}
-				targetAgent = spawnInfo.AgentID()
-				targetPane = spawnInfo.Pane
-
-				// Wake witness and refinery to monitor the new polecat
-				wakeRigAgents(rigName)
-			}
-		} else {
-			// Slinging to an existing agent
-			// Skip pane lookup if --naked (agent may be terminated)
-			targetAgent, targetPane, _, err = resolveTargetAgent(target, slingNaked)
-			if err != nil {
-				return fmt.Errorf("resolving target: %w", err)
-			}
-		}
-	} else {
-		// Slinging to self
-		targetAgent, targetPane, _, err = resolveSelfTarget()
-		if err != nil {
-			return err
-		}
-	}
-
-	// Display what we're doing
+	// Handle formula modes (not batch-compatible)
 	if formulaName != "" {
-		fmt.Printf("%s Slinging formula %s on %s to %s...\n", style.Bold.Render("🎯"), formulaName, beadID, targetAgent)
-	} else {
-		fmt.Printf("%s Slinging %s to %s...\n", style.Bold.Render("🎯"), beadID, targetAgent)
+		if len(beadIDs) > 1 {
+			return fmt.Errorf("batch slinging not supported with formulas (use one bead at a time)")
+		}
+		if slingOnTarget != "" {
+			// Formula-on-bead mode
+			return runSlingFormulaOnBead(formulaName, beadIDs[0], target)
+		}
+		// Standalone formula mode
+		return runSlingFormula(args)
 	}
 
-	// Check if bead is already pinned (guard against accidental re-sling)
+	// Batch mode: multiple beads
+	if len(beadIDs) > 1 {
+		return runSlingBatch(beadIDs, target)
+	}
+
+	// Single bead mode (original behavior)
+	return runSlingSingle(beadIDs[0], target)
+}
+
+// parseSlingsArgs separates bead IDs from target and detects formula mode.
+// Returns: beadIDs, target (may be empty), formulaName (if formula mode), error
+func parseSlingsArgs(args []string) (beadIDs []string, target string, formulaName string, err error) {
+	// Handle --quality flag (converts to formula-on-bead)
+	if slingQuality != "" {
+		formula, err := qualityToFormula(slingQuality)
+		if err != nil {
+			return nil, "", "", err
+		}
+		if slingOnTarget != "" {
+			return nil, "", "", fmt.Errorf("--quality cannot be used with --on (both specify formula)")
+		}
+		// First arg is the bead, wrap with formula
+		if len(args) < 1 {
+			return nil, "", "", fmt.Errorf("--quality requires a bead argument")
+		}
+		beadID := args[0]
+		target := ""
+		if len(args) > 1 {
+			target = args[1]
+		}
+		return []string{beadID}, target, formula, nil
+	}
+
+	// Handle --on flag (formula-on-bead mode)
+	if slingOnTarget != "" {
+		if len(args) < 1 {
+			return nil, "", "", fmt.Errorf("--on requires a formula argument")
+		}
+		formula := args[0]
+		if err := verifyFormulaExists(formula); err != nil {
+			return nil, "", "", err
+		}
+		if err := verifyBeadExists(slingOnTarget); err != nil {
+			return nil, "", "", err
+		}
+		target := ""
+		if len(args) > 1 {
+			target = args[1]
+		}
+		return []string{slingOnTarget}, target, formula, nil
+	}
+
+	// Standard mode: identify beads vs target
+	// Last arg that's a valid target (rig, agent, dog, ".") is the target
+	// Everything before it must be beads
+
+	if len(args) == 1 {
+		// Single arg: could be bead (sling to self) or formula
+		firstArg := args[0]
+		if err := verifyBeadExists(firstArg); err == nil {
+			return []string{firstArg}, "", "", nil
+		}
+		if err := verifyFormulaExists(firstArg); err == nil {
+			return nil, "", firstArg, nil
+		}
+		return nil, "", "", fmt.Errorf("'%s' is not a valid bead or formula", firstArg)
+	}
+
+	// Multiple args: check if last arg is a target
+	lastArg := args[len(args)-1]
+	isTarget := isTargetSpec(lastArg)
+
+	if isTarget {
+		// Last arg is target, all before must be beads
+		target = lastArg
+		for _, arg := range args[:len(args)-1] {
+			if err := verifyBeadExists(arg); err != nil {
+				// Could be a formula (single bead + formula case)
+				if len(args) == 2 {
+					if err := verifyFormulaExists(arg); err == nil {
+						return nil, target, arg, nil
+					}
+				}
+				return nil, "", "", fmt.Errorf("'%s' is not a valid bead", arg)
+			}
+			beadIDs = append(beadIDs, arg)
+		}
+	} else {
+		// No target specified - last arg must also be a bead
+		for _, arg := range args {
+			if err := verifyBeadExists(arg); err != nil {
+				return nil, "", "", fmt.Errorf("'%s' is not a valid bead or target", arg)
+			}
+			beadIDs = append(beadIDs, arg)
+		}
+	}
+
+	return beadIDs, target, "", nil
+}
+
+// isTargetSpec checks if an argument looks like a target (rig, agent, dog, or ".")
+func isTargetSpec(arg string) bool {
+	// "." means self
+	if arg == "." {
+		return true
+	}
+
+	// Check if it's a dog target
+	if _, isDog := IsDogTarget(arg); isDog {
+		return true
+	}
+
+	// Check if it's a rig name
+	if _, isRig := IsRigName(arg); isRig {
+		return true
+	}
+
+	// Check if it resolves as an agent (e.g., "mayor", "crew", "gastown/polecats/Toast")
+	// A valid target will either contain "/" or be a known role
+	if strings.Contains(arg, "/") {
+		return true
+	}
+	if arg == "mayor" || arg == "deacon" || arg == "crew" || arg == "witness" || arg == "refinery" {
+		return true
+	}
+
+	return false
+}
+
+// runSlingBatch handles slinging multiple beads to a target.
+// Creates a convoy to track all work and spawns a polecat for each bead.
+func runSlingBatch(beadIDs []string, target string) error {
+	fmt.Printf("%s Batch slinging %d beads to %s...\n", style.Bold.Render("🎯"), len(beadIDs), target)
+
+	// Verify all beads exist and collect their info
+	var beadInfos []*beadInfo
+	for _, beadID := range beadIDs {
+		info, err := getBeadInfo(beadID)
+		if err != nil {
+			return fmt.Errorf("checking bead %s: %w", beadID, err)
+		}
+		if info.Status == "pinned" && !slingForce {
+			return fmt.Errorf("bead %s is already pinned to %s\nUse --force to re-sling", beadID, info.Assignee)
+		}
+		beadInfos = append(beadInfos, info)
+	}
+
+	// Auto-convoy for batch: create convoy to track all beads (unless --no-convoy)
+	var convoyID string
+	if !slingNoConvoy {
+		convoyName := slingConvoyName
+		if convoyName == "" {
+			convoyName = fmt.Sprintf("Batch: %s", beadInfos[0].Title)
+		}
+
+		if slingDryRun {
+			fmt.Printf("Would create convoy '%s'\n", convoyName)
+			for _, beadID := range beadIDs {
+				fmt.Printf("  Would track: %s\n", beadID)
+			}
+		} else {
+			var err error
+			convoyID, err = createBatchConvoy(convoyName, beadIDs)
+			if err != nil {
+				fmt.Printf("%s Could not create batch convoy: %v\n", style.Dim.Render("Warning:"), err)
+			} else {
+				fmt.Printf("%s Created convoy %s tracking %d beads\n", style.Bold.Render("→"), convoyID, len(beadIDs))
+			}
+		}
+	}
+
+	// Sling each bead
+	var succeeded, failed int
+	var errors []string
+
+	for i, beadID := range beadIDs {
+		fmt.Printf("\n%s [%d/%d] Slinging %s...\n", style.Bold.Render("→"), i+1, len(beadIDs), beadID)
+
+		err := runSlingSingle(beadID, target)
+		if err != nil {
+			failed++
+			errMsg := fmt.Sprintf("%s: %v", beadID, err)
+			errors = append(errors, errMsg)
+			fmt.Printf("%s Failed: %v\n", style.Dim.Render("✗"), err)
+			// Continue with remaining beads
+		} else {
+			succeeded++
+		}
+	}
+
+	// Summary
+	fmt.Printf("\n%s Batch complete: %d succeeded, %d failed\n", style.Bold.Render("📊"), succeeded, failed)
+	if convoyID != "" {
+		fmt.Printf("  Convoy: %s\n", convoyID)
+	}
+	if len(errors) > 0 {
+		fmt.Printf("  Errors:\n")
+		for _, e := range errors {
+			fmt.Printf("    - %s\n", e)
+		}
+		return fmt.Errorf("%d of %d beads failed to sling", failed, len(beadIDs))
+	}
+
+	return nil
+}
+
+// createBatchConvoy creates a convoy for a batch of beads.
+func createBatchConvoy(name string, beadIDs []string) (string, error) {
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil {
+		return "", fmt.Errorf("finding town root: %w", err)
+	}
+
+	townBeads := filepath.Join(townRoot, ".beads")
+
+	// Generate convoy ID with cv- prefix
+	convoyID := fmt.Sprintf("hq-cv-%s", slingGenerateShortID())
+
+	// Create convoy
+	description := fmt.Sprintf("Batch sling of %d beads", len(beadIDs))
+
+	createArgs := []string{
+		"create",
+		"--type=convoy",
+		"--id=" + convoyID,
+		"--title=" + name,
+		"--description=" + description,
+	}
+
+	createCmd := exec.Command("bd", createArgs...)
+	createCmd.Dir = townBeads
+	createCmd.Stderr = os.Stderr
+
+	if err := createCmd.Run(); err != nil {
+		return "", fmt.Errorf("creating convoy: %w", err)
+	}
+
+	// Add tracking relations for all beads
+	for _, beadID := range beadIDs {
+		depArgs := []string{"dep", "add", convoyID, beadID, "--type=tracks"}
+		depCmd := exec.Command("bd", depArgs...)
+		depCmd.Dir = townBeads
+		depCmd.Stderr = os.Stderr
+
+		if err := depCmd.Run(); err != nil {
+			// Log warning but continue - some beads tracked is better than none
+			fmt.Printf("%s Could not track %s: %v\n", style.Dim.Render("Warning:"), beadID, err)
+		}
+	}
+
+	return convoyID, nil
+}
+
+// runSlingFormulaOnBead handles formula-on-bead mode.
+func runSlingFormulaOnBead(formulaName, beadID, target string) error {
+	// Verify formula exists
+	if err := verifyFormulaExists(formulaName); err != nil {
+		return err
+	}
+
+	// Resolve target
+	targetAgent, targetPane, err := resolveTarget(target)
+	if err != nil {
+		return err
+	}
+
+	// Get bead info
 	info, err := getBeadInfo(beadID)
 	if err != nil {
 		return fmt.Errorf("checking bead status: %w", err)
 	}
+
+	fmt.Printf("%s Slinging formula %s on %s to %s...\n", style.Bold.Render("🎯"), formulaName, beadID, targetAgent)
+
+	if slingDryRun {
+		fmt.Printf("Would instantiate formula %s:\n", formulaName)
+		fmt.Printf("  1. bd cook %s\n", formulaName)
+		fmt.Printf("  2. bd mol wisp %s --var feature=\"%s\"\n", formulaName, info.Title)
+		fmt.Printf("  3. bd mol bond <wisp-root> %s\n", beadID)
+		fmt.Printf("  4. bd update <compound-root> --status=hooked --assignee=%s\n", targetAgent)
+		return nil
+	}
+
+	// Step 1: Cook the formula
+	cookCmd := exec.Command("bd", "cook", formulaName)
+	cookCmd.Stderr = os.Stderr
+	if err := cookCmd.Run(); err != nil {
+		return fmt.Errorf("cooking formula %s: %w", formulaName, err)
+	}
+
+	// Step 2: Create wisp with feature variable
+	featureVar := fmt.Sprintf("feature=%s", info.Title)
+	wispArgs := []string{"mol", "wisp", formulaName, "--var", featureVar, "--json"}
+	wispCmd := exec.Command("bd", wispArgs...)
+	wispCmd.Stderr = os.Stderr
+	wispOut, err := wispCmd.Output()
+	if err != nil {
+		return fmt.Errorf("creating wisp for formula %s: %w", formulaName, err)
+	}
+
+	var wispResult struct {
+		RootID string `json:"root_id"`
+	}
+	if err := json.Unmarshal(wispOut, &wispResult); err != nil {
+		return fmt.Errorf("parsing wisp output: %w", err)
+	}
+	wispRootID := wispResult.RootID
+	fmt.Printf("%s Formula wisp created: %s\n", style.Bold.Render("✓"), wispRootID)
+
+	// Step 3: Bond wisp to original bead
+	bondArgs := []string{"mol", "bond", wispRootID, beadID, "--json"}
+	bondCmd := exec.Command("bd", bondArgs...)
+	bondCmd.Stderr = os.Stderr
+	bondOut, err := bondCmd.Output()
+	if err != nil {
+		return fmt.Errorf("bonding formula to bead: %w", err)
+	}
+
+	var bondResult struct {
+		RootID string `json:"root_id"`
+	}
+	if err := json.Unmarshal(bondOut, &bondResult); err == nil && bondResult.RootID != "" {
+		wispRootID = bondResult.RootID
+	}
+	fmt.Printf("%s Formula bonded to %s\n", style.Bold.Render("✓"), beadID)
+
+	// Hook the compound root
+	hookCmd := exec.Command("bd", "update", wispRootID, "--status=hooked", "--assignee="+targetAgent)
+	hookCmd.Stderr = os.Stderr
+	if err := hookCmd.Run(); err != nil {
+		return fmt.Errorf("hooking bead: %w", err)
+	}
+
+	fmt.Printf("%s Work attached to hook (status=hooked)\n", style.Bold.Render("✓"))
+
+	// Log event and update agent state
+	actor := detectActor()
+	_ = events.LogFeed(events.TypeSling, actor, events.SlingPayload(wispRootID, targetAgent))
+	updateAgentHookBead(targetAgent, wispRootID)
+
+	// Nudge if possible
+	if targetPane != "" {
+		if err := injectStartPrompt(targetPane, wispRootID, slingSubject, slingArgs); err != nil {
+			fmt.Printf("%s Could not nudge: %v\n", style.Dim.Render("○"), err)
+		} else {
+			fmt.Printf("%s Start prompt sent\n", style.Bold.Render("▶"))
+		}
+	}
+
+	return nil
+}
+
+// resolveTarget converts a target spec to agent ID and pane.
+// Handles rig auto-spawn, dog dispatch, etc.
+func resolveTarget(target string) (agentID string, pane string, err error) {
+	if target == "" || target == "." {
+		agentID, pane, _, err = resolveSelfTarget()
+		return
+	}
+
+	// Check for dog target
+	if dogName, isDog := IsDogTarget(target); isDog {
+		if slingDryRun {
+			if dogName == "" {
+				agentID = "deacon/dogs/<idle>"
+			} else {
+				agentID = fmt.Sprintf("deacon/dogs/%s", dogName)
+			}
+			pane = "<dog-pane>"
+			return
+		}
+		dispatchInfo, dispatchErr := DispatchToDog(dogName, slingCreate)
+		if dispatchErr != nil {
+			return "", "", fmt.Errorf("dispatching to dog: %w", dispatchErr)
+		}
+		return dispatchInfo.AgentID, dispatchInfo.Pane, nil
+	}
+
+	// Check for rig (auto-spawn polecat)
+	if rigName, isRig := IsRigName(target); isRig {
+		if slingDryRun {
+			agentID = fmt.Sprintf("%s/polecats/<new>", rigName)
+			pane = "<new-pane>"
+			return
+		}
+		spawnOpts := SlingSpawnOptions{
+			Force:   slingForce,
+			Naked:   slingNaked,
+			Account: slingAccount,
+			Create:  slingCreate,
+		}
+		spawnInfo, spawnErr := SpawnPolecatForSling(rigName, spawnOpts)
+		if spawnErr != nil {
+			return "", "", fmt.Errorf("spawning polecat: %w", spawnErr)
+		}
+		wakeRigAgents(rigName)
+		return spawnInfo.AgentID(), spawnInfo.Pane, nil
+	}
+
+	// Existing agent
+	agentID, pane, _, err = resolveTargetAgent(target, slingNaked)
+	return
+}
+
+// runSlingSingle handles slinging a single bead (original behavior).
+func runSlingSingle(beadID, target string) error {
+	// Resolve target
+	targetAgent, targetPane, err := resolveTarget(target)
+	if err != nil {
+		return err
+	}
+
+	// Get bead info
+	info, err := getBeadInfo(beadID)
+	if err != nil {
+		return fmt.Errorf("checking bead status: %w", err)
+	}
+
+	// Check if already pinned
 	if info.Status == "pinned" && !slingForce {
 		assignee := info.Assignee
 		if assignee == "" {
@@ -290,22 +598,20 @@ func runSling(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("bead %s is already pinned to %s\nUse --force to re-sling", beadID, assignee)
 	}
 
-	// Auto-convoy: check if issue is already tracked by a convoy
-	// If not, create one for dashboard visibility (unless --no-convoy is set)
-	if !slingNoConvoy && formulaName == "" {
+	fmt.Printf("%s Slinging %s to %s...\n", style.Bold.Render("🎯"), beadID, targetAgent)
+
+	// Auto-convoy for single bead (unless in batch mode or --no-convoy)
+	if !slingNoConvoy {
 		existingConvoy := isTrackedByConvoy(beadID)
 		if existingConvoy == "" {
 			if slingDryRun {
 				fmt.Printf("Would create convoy 'Work: %s'\n", info.Title)
-				fmt.Printf("Would add tracking relation to %s\n", beadID)
 			} else {
 				convoyID, err := createAutoConvoy(beadID, info.Title)
 				if err != nil {
-					// Log warning but don't fail - convoy is optional
 					fmt.Printf("%s Could not create auto-convoy: %v\n", style.Dim.Render("Warning:"), err)
 				} else {
-					fmt.Printf("%s Created convoy 🚚 %s\n", style.Bold.Render("→"), convoyID)
-					fmt.Printf("  Tracking: %s\n", beadID)
+					fmt.Printf("%s Created convoy %s\n", style.Bold.Render("→"), convoyID)
 				}
 			}
 		} else {
@@ -314,87 +620,14 @@ func runSling(cmd *cobra.Command, args []string) error {
 	}
 
 	if slingDryRun {
-		if formulaName != "" {
-			fmt.Printf("Would instantiate formula %s:\n", formulaName)
-			fmt.Printf("  1. bd cook %s\n", formulaName)
-			fmt.Printf("  2. bd mol wisp %s --var feature=\"%s\"\n", formulaName, info.Title)
-			fmt.Printf("  3. bd mol bond <wisp-root> %s\n", beadID)
-			fmt.Printf("  4. bd update <compound-root> --status=hooked --assignee=%s\n", targetAgent)
-		} else {
-			fmt.Printf("Would run: bd update %s --status=hooked --assignee=%s\n", beadID, targetAgent)
-		}
-		if slingSubject != "" {
-			fmt.Printf("  subject (in nudge): %s\n", slingSubject)
-		}
-		if slingMessage != "" {
-			fmt.Printf("  context: %s\n", slingMessage)
-		}
+		fmt.Printf("Would run: bd update %s --status=hooked --assignee=%s\n", beadID, targetAgent)
 		if slingArgs != "" {
-			fmt.Printf("  args (in nudge): %s\n", slingArgs)
+			fmt.Printf("  args: %s\n", slingArgs)
 		}
-		fmt.Printf("Would inject start prompt to pane: %s\n", targetPane)
 		return nil
 	}
 
-	// Formula-on-bead mode: instantiate formula and bond to original bead
-	if formulaName != "" {
-		fmt.Printf("  Instantiating formula %s...\n", formulaName)
-
-		// Step 1: Cook the formula (ensures proto exists)
-		cookCmd := exec.Command("bd", "cook", formulaName)
-		cookCmd.Stderr = os.Stderr
-		if err := cookCmd.Run(); err != nil {
-			return fmt.Errorf("cooking formula %s: %w", formulaName, err)
-		}
-
-		// Step 2: Create wisp with feature variable from bead title
-		featureVar := fmt.Sprintf("feature=%s", info.Title)
-		wispArgs := []string{"mol", "wisp", formulaName, "--var", featureVar, "--json"}
-		wispCmd := exec.Command("bd", wispArgs...)
-		wispCmd.Stderr = os.Stderr
-		wispOut, err := wispCmd.Output()
-		if err != nil {
-			return fmt.Errorf("creating wisp for formula %s: %w", formulaName, err)
-		}
-
-		// Parse wisp output to get the root ID
-		var wispResult struct {
-			RootID string `json:"root_id"`
-		}
-		if err := json.Unmarshal(wispOut, &wispResult); err != nil {
-			return fmt.Errorf("parsing wisp output: %w", err)
-		}
-		wispRootID := wispResult.RootID
-		fmt.Printf("%s Formula wisp created: %s\n", style.Bold.Render("✓"), wispRootID)
-
-		// Step 3: Bond wisp to original bead (creates compound)
-		bondArgs := []string{"mol", "bond", wispRootID, beadID, "--json"}
-		bondCmd := exec.Command("bd", bondArgs...)
-		bondCmd.Stderr = os.Stderr
-		bondOut, err := bondCmd.Output()
-		if err != nil {
-			return fmt.Errorf("bonding formula to bead: %w", err)
-		}
-
-		// Parse bond output - the wisp root becomes the compound root
-		// After bonding, we hook the wisp root (which now contains the original bead)
-		var bondResult struct {
-			RootID string `json:"root_id"`
-		}
-		if err := json.Unmarshal(bondOut, &bondResult); err != nil {
-			// Fallback: use wisp root as the compound root
-			fmt.Printf("%s Could not parse bond output, using wisp root\n", style.Dim.Render("Warning:"))
-		} else if bondResult.RootID != "" {
-			wispRootID = bondResult.RootID
-		}
-
-		fmt.Printf("%s Formula bonded to %s\n", style.Bold.Render("✓"), beadID)
-
-		// Update beadID to hook the compound root instead of bare bead
-		beadID = wispRootID
-	}
-
-	// Hook the bead using bd update (discovery-based approach)
+	// Hook the bead
 	hookCmd := exec.Command("bd", "update", beadID, "--status=hooked", "--assignee="+targetAgent)
 	hookCmd.Stderr = os.Stderr
 	if err := hookCmd.Run(); err != nil {
@@ -403,30 +636,27 @@ func runSling(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("%s Work attached to hook (status=hooked)\n", style.Bold.Render("✓"))
 
-	// Log sling event to activity feed
+	// Log event
 	actor := detectActor()
 	_ = events.LogFeed(events.TypeSling, actor, events.SlingPayload(beadID, targetAgent))
 
-	// Update agent bead's hook_bead field (ZFC: agents track their current work)
+	// Update agent state
 	updateAgentHookBead(targetAgent, beadID)
 
-	// Store args in bead description (no-tmux mode: beads as data plane)
+	// Store args if provided
 	if slingArgs != "" {
 		if err := storeArgsInBead(beadID, slingArgs); err != nil {
-			// Warn but don't fail - args will still be in the nudge prompt
-			fmt.Printf("%s Could not store args in bead: %v\n", style.Dim.Render("Warning:"), err)
+			fmt.Printf("%s Could not store args: %v\n", style.Dim.Render("Warning:"), err)
 		} else {
-			fmt.Printf("%s Args stored in bead (durable)\n", style.Bold.Render("✓"))
+			fmt.Printf("%s Args stored in bead\n", style.Bold.Render("✓"))
 		}
 	}
 
-	// Try to inject the "start now" prompt (graceful if no tmux)
+	// Nudge if possible
 	if targetPane == "" {
 		fmt.Printf("%s No pane to nudge (agent will discover work via gt prime)\n", style.Dim.Render("○"))
 	} else if err := injectStartPrompt(targetPane, beadID, slingSubject, slingArgs); err != nil {
-		// Graceful fallback for no-tmux mode
-		fmt.Printf("%s Could not nudge (no tmux?): %v\n", style.Dim.Render("○"), err)
-		fmt.Printf("  Agent will discover work via gt prime / bd show\n")
+		fmt.Printf("%s Could not nudge: %v\n", style.Dim.Render("○"), err)
 	} else {
 		fmt.Printf("%s Start prompt sent\n", style.Bold.Render("▶"))
 	}

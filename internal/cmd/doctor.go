@@ -64,6 +64,13 @@ Patrol checks:
   - patrol-plugins-accessible Verify plugin directories
   - patrol-roles-have-prompts Verify role prompts exist
 
+Config consistency checks:
+  - session-hooks            Check settings.json session hook consistency (fixable)
+
+Crew workspace checks (fixable):
+  - crew-state               Validate crew worker state.json files
+  - crew-commands            Check crew workspaces have .claude/commands/ provisioned
+
 Use --fix to attempt automatic fixes for issues that support it.
 Use --rig to check a specific rig instead of the entire workspace.`,
 	RunE: runDoctor,
@@ -127,9 +134,11 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewSettingsCheck())
 	d.Register(doctor.NewRuntimeGitignoreCheck())
 	d.Register(doctor.NewLegacyGastownCheck())
+	d.Register(doctor.NewSessionHooksConsistencyCheck())
 
 	// Crew workspace checks
 	d.Register(doctor.NewCrewStateCheck())
+	d.Register(doctor.NewCrewCommandsCheck())
 
 	// Lifecycle hygiene checks
 	d.Register(doctor.NewLifecycleHygieneCheck())
