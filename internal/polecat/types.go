@@ -12,6 +12,14 @@ const (
 	// This is the initial and primary state for transient polecats.
 	StateWorking State = "working"
 
+	// StateMRSubmitted means the polecat has submitted its MR to the queue.
+	// In the ephemeral model, this is a transitional state between working and recyclable.
+	// The polecat is waiting for the refinery to acknowledge the MR is queued.
+	// State transitions:
+	//   working → mr_submitted (after `gt done --exit COMPLETED` creates MR)
+	//   mr_submitted → recyclable (after branch confirmed pushed to origin)
+	StateMRSubmitted State = "mr_submitted"
+
 	// StateRecyclable means the polecat has submitted its MR and is ready
 	// for cleanup. This is the ephemeral exit state set by `gt done --exit COMPLETED`.
 	// The polecat has pushed all work to origin and can be safely nuked.
@@ -49,6 +57,22 @@ func (s State) IsActive() bool {
 // ephemeral polecats.
 func (s State) IsRecyclable() bool {
 	return s == StateRecyclable
+}
+
+// IsMRSubmitted returns true if the polecat has submitted its MR
+// but hasn't been confirmed recyclable yet. This is the transitional
+// state in the ephemeral model.
+func (s State) IsMRSubmitted() bool {
+	return s == StateMRSubmitted
+}
+
+// IsReadyForCleanup returns true if the polecat is in a state where
+// the Witness can consider cleaning it up. This includes:
+//   - mr_submitted: MR submitted, waiting for confirmation
+//   - recyclable: Ready for immediate cleanup
+//   - done: Legacy state, equivalent to recyclable
+func (s State) IsReadyForCleanup() bool {
+	return s == StateMRSubmitted || s == StateRecyclable || s == StateDone
 }
 
 // Polecat represents a worker agent in a rig.

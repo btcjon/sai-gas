@@ -22,6 +22,10 @@ var (
 	// MERGED <name> - refinery confirms branch merged
 	PatternMerged = regexp.MustCompile(`^MERGED\s+(\S+)`)
 
+	// CONFLICT_DISPATCH <mr-id> - refinery requesting conflict resolution dispatch
+	// Sent when an MR has merge conflicts that need a polecat to resolve.
+	PatternConflictDispatch = regexp.MustCompile(`^CONFLICT_DISPATCH\s+(\S+)`)
+
 	// HANDOFF - session continuity message
 	PatternHandoff = regexp.MustCompile(`^🤝\s*HANDOFF`)
 
@@ -37,6 +41,7 @@ const (
 	ProtoLifecycleShutdown ProtocolType = "lifecycle_shutdown"
 	ProtoHelp              ProtocolType = "help"
 	ProtoMerged            ProtocolType = "merged"
+	ProtoConflictDispatch  ProtocolType = "conflict_dispatch"
 	ProtoHandoff           ProtocolType = "handoff"
 	ProtoSwarmStart        ProtocolType = "swarm_start"
 	ProtoUnknown           ProtocolType = "unknown"
@@ -77,6 +82,20 @@ type SwarmStartPayload struct {
 	StartedAt time.Time
 }
 
+// ConflictDispatchPayload contains parsed data from a CONFLICT_DISPATCH message.
+// This is sent by the Refinery when an MR has merge conflicts that need resolution.
+type ConflictDispatchPayload struct {
+	MRID            string    // The MR ID that has conflicts
+	Branch          string    // Source branch that needs rebasing
+	TargetBranch    string    // Target branch (usually "main")
+	ConflictSHA     string    // SHA of target when conflict detected
+	SourceIssue     string    // Original work issue being merged
+	Worker          string    // Original polecat that did the work
+	RetryCount      int       // How many times this has been retried
+	Rig             string    // Which rig this is in
+	RequestedAt     time.Time // When conflict was detected
+}
+
 // ClassifyMessage determines the protocol type from a message subject.
 func ClassifyMessage(subject string) ProtocolType {
 	switch {
@@ -88,6 +107,8 @@ func ClassifyMessage(subject string) ProtocolType {
 		return ProtoHelp
 	case PatternMerged.MatchString(subject):
 		return ProtoMerged
+	case PatternConflictDispatch.MatchString(subject):
+		return ProtoConflictDispatch
 	case PatternHandoff.MatchString(subject):
 		return ProtoHandoff
 	case PatternSwarmStart.MatchString(subject):
@@ -218,6 +239,51 @@ func ParseSwarmStart(body string) (*SwarmStartPayload, error) {
 			payload.SwarmID = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "SwarmID:"), "swarm_id:"))
 		} else if strings.HasPrefix(line, "Total:") {
 			fmt.Sscanf(line, "Total: %d", &payload.Total)
+		}
+	}
+
+	return payload, nil
+}
+
+// ParseConflictDispatch extracts payload from a CONFLICT_DISPATCH message.
+// Subject format: CONFLICT_DISPATCH <mr-id>
+// Body format:
+//
+//	Branch: <source-branch>
+//	Target: <target-branch>
+//	ConflictSHA: <sha>
+//	SourceIssue: <issue-id>
+//	Worker: <polecat-name>
+//	Rig: <rig-name>
+//	RetryCount: <count>
+func ParseConflictDispatch(subject, body string) (*ConflictDispatchPayload, error) {
+	matches := PatternConflictDispatch.FindStringSubmatch(subject)
+	if len(matches) < 2 {
+		return nil, fmt.Errorf("invalid CONFLICT_DISPATCH subject: %s", subject)
+	}
+
+	payload := &ConflictDispatchPayload{
+		MRID:        matches[1],
+		RequestedAt: time.Now(),
+	}
+
+	// Parse body for structured fields
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Branch:") {
+			payload.Branch = strings.TrimSpace(strings.TrimPrefix(line, "Branch:"))
+		} else if strings.HasPrefix(line, "Target:") {
+			payload.TargetBranch = strings.TrimSpace(strings.TrimPrefix(line, "Target:"))
+		} else if strings.HasPrefix(line, "ConflictSHA:") {
+			payload.ConflictSHA = strings.TrimSpace(strings.TrimPrefix(line, "ConflictSHA:"))
+		} else if strings.HasPrefix(line, "SourceIssue:") {
+			payload.SourceIssue = strings.TrimSpace(strings.TrimPrefix(line, "SourceIssue:"))
+		} else if strings.HasPrefix(line, "Worker:") {
+			payload.Worker = strings.TrimSpace(strings.TrimPrefix(line, "Worker:"))
+		} else if strings.HasPrefix(line, "Rig:") {
+			payload.Rig = strings.TrimSpace(strings.TrimPrefix(line, "Rig:"))
+		} else if strings.HasPrefix(line, "RetryCount:") {
+			fmt.Sscanf(strings.TrimPrefix(line, "RetryCount:"), "%d", &payload.RetryCount)
 		}
 	}
 

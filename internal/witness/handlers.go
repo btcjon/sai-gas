@@ -769,6 +769,100 @@ func AutoNukeIfClean(workDir, rigName, polecatName string) *NukePolecatResult {
 	return result
 }
 
+// AutoNukeRecyclable checks if a recyclable polecat can be nuked immediately.
+// In the ephemeral model, recyclable polecats have already:
+// 1. Submitted their MR to the queue
+// 2. Pushed all work to origin
+// 3. Set cleanup_status=clean
+//
+// Unlike AutoNukeIfClean (which waits for MERGED), this function nukes
+// immediately once the polecat signals recyclable AND the branch is confirmed
+// pushed to origin. The MR merge will happen asynchronously.
+//
+// This implements gt-si8rq.9: "Don't wait for merge to recycle polecat"
+func AutoNukeRecyclable(workDir, rigName, polecatName string) *NukePolecatResult {
+	result := &NukePolecatResult{}
+
+	// Get agent state and cleanup status from agent bead
+	info := getAgentBeadInfo(workDir, rigName, polecatName)
+
+	// Must be in recyclable or mr_submitted state
+	if info.AgentState != "recyclable" && info.AgentState != "mr_submitted" {
+		result.Skipped = true
+		result.Reason = fmt.Sprintf("skipped: agent_state=%s (not recyclable)", info.AgentState)
+		return result
+	}
+
+	// Cleanup status must be clean
+	if info.CleanupStatus != "clean" {
+		result.Skipped = true
+		result.Reason = fmt.Sprintf("skipped: cleanup_status=%s (not clean)", info.CleanupStatus)
+		return result
+	}
+
+	// Verify branch is pushed to origin before nuking
+	pushed, err := verifyBranchPushed(workDir, rigName, polecatName)
+	if err != nil {
+		result.Skipped = true
+		result.Reason = fmt.Sprintf("skipped: couldn't verify branch pushed: %v", err)
+		return result
+	}
+	if !pushed {
+		result.Skipped = true
+		result.Reason = "skipped: branch not confirmed pushed to origin"
+		return result
+	}
+
+	// Safe to nuke - branch is on origin, polecat is recyclable
+	if err := NukePolecat(workDir, rigName, polecatName); err != nil {
+		result.Error = err
+		result.Reason = fmt.Sprintf("nuke failed: %v", err)
+	} else {
+		result.Nuked = true
+		result.Reason = fmt.Sprintf("auto-nuked recyclable polecat (branch pushed, cleanup_status=clean)")
+	}
+
+	return result
+}
+
+// verifyBranchPushed checks if the polecat's current branch is pushed to origin.
+// This is the pre-nuke safety check for ephemeral polecats.
+func verifyBranchPushed(workDir, rigName, polecatName string) (bool, error) {
+	// Find town root from workDir
+	townRoot, err := workspace.Find(workDir)
+	if err != nil || townRoot == "" {
+		return false, fmt.Errorf("finding town root: %v", err)
+	}
+
+	// Construct polecat path
+	polecatPath := filepath.Join(townRoot, rigName, "polecats", polecatName)
+
+	// Get git for the polecat worktree
+	g := git.NewGit(polecatPath)
+
+	// Get current branch
+	branch, err := g.CurrentBranch()
+	if err != nil {
+		return false, fmt.Errorf("getting current branch: %w", err)
+	}
+
+	// Get local HEAD SHA
+	localSHA, err := g.Rev("HEAD")
+	if err != nil {
+		return false, fmt.Errorf("getting HEAD: %w", err)
+	}
+
+	// Get remote branch SHA (if it exists)
+	remoteSHA, err := g.Rev("origin/" + branch)
+	if err != nil {
+		// Remote branch doesn't exist
+		return false, nil
+	}
+
+	// Branch is pushed if remote SHA matches local SHA
+	return localSHA == remoteSHA, nil
+}
+
 // verifyCommitOnMain checks if the polecat's current commit is on main.
 // This prevents nuking a polecat whose work wasn't actually merged.
 //
@@ -807,4 +901,129 @@ func verifyCommitOnMain(workDir, rigName, polecatName string) (bool, error) {
 	}
 
 	return isOnMain, nil
+}
+
+// HandleConflictDispatch processes a CONFLICT_DISPATCH message from the Refinery.
+// Creates a conflict-resolution bead and dispatches it to an available polecat.
+//
+// The conflict-resolution workflow:
+// 1. Refinery detects merge conflict in MR
+// 2. Refinery sends CONFLICT_DISPATCH to Witness
+// 3. Witness creates conflict-resolution task bead
+// 4. Witness assigns task to an available polecat (or spawns new one)
+// 5. Polecat rebases, resolves conflicts, pushes
+// 6. Polecat signals re-queue and exits
+// 7. MR re-enters queue with updated branch
+func HandleConflictDispatch(workDir, rigName string, msg *mail.Message) *HandlerResult {
+	result := &HandlerResult{
+		MessageID:    msg.ID,
+		ProtocolType: ProtoConflictDispatch,
+	}
+
+	// Parse the message
+	payload, err := ParseConflictDispatch(msg.Subject, msg.Body)
+	if err != nil {
+		result.Error = fmt.Errorf("parsing CONFLICT_DISPATCH: %w", err)
+		return result
+	}
+
+	// Create conflict-resolution task bead
+	taskTitle := fmt.Sprintf("Resolve merge conflicts: %s", payload.Branch)
+	taskDesc := fmt.Sprintf(`## Conflict Resolution Task
+
+Rebase and resolve merge conflicts for MR.
+
+## Metadata
+- Original MR: %s
+- Branch: %s
+- Conflict with: %s@%s
+- Original issue: %s
+- Retry count: %d
+
+## Instructions
+1. Checkout the branch: %s
+2. Rebase onto %s
+3. Resolve any conflicts
+4. Push the rebased branch (force push allowed)
+5. Signal MR re-queue with: gt conflict-resolved %s
+
+The branch has been pushed to origin. Fetch and resolve locally.`,
+		payload.MRID,
+		payload.Branch,
+		payload.TargetBranch,
+		payload.ConflictSHA,
+		payload.SourceIssue,
+		payload.RetryCount,
+		payload.Branch,
+		payload.TargetBranch,
+		payload.MRID,
+	)
+
+	// Create the task bead via bd create
+	cmd := exec.Command("bd", "create",
+		"--title", taskTitle,
+		"--description", taskDesc,
+		"--type", "task",
+		"--priority", "1", // High priority for conflict resolution
+		"--labels", fmt.Sprintf("conflict-resolution,mr:%s,branch:%s", payload.MRID, payload.Branch),
+	)
+	cmd.Dir = workDir
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg != "" {
+			result.Error = fmt.Errorf("creating conflict task: %s", errMsg)
+		} else {
+			result.Error = fmt.Errorf("creating conflict task: %w", err)
+		}
+		return result
+	}
+
+	// Extract task ID from output
+	output := strings.TrimSpace(stdout.String())
+	taskID := extractBeadID(output)
+
+	// Update the MR with the conflict task ID
+	// This links the MR to the task for tracking
+	if payload.MRID != "" && taskID != "" {
+		updateMRWithConflictTask(workDir, payload.MRID, taskID)
+	}
+
+	result.Handled = true
+	result.WispCreated = taskID
+	result.Action = fmt.Sprintf("created conflict-resolution task %s for MR %s (branch: %s, retry: %d)",
+		taskID, payload.MRID, payload.Branch, payload.RetryCount)
+
+	return result
+}
+
+// extractBeadID extracts a bead ID from bd create output.
+func extractBeadID(output string) string {
+	// bd create outputs "Created: <id>" or just the ID
+	if strings.HasPrefix(output, "Created:") {
+		return strings.TrimSpace(strings.TrimPrefix(output, "Created:"))
+	}
+
+	// Try to find a bead ID pattern in the output
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		// Look for typical bead ID patterns (e.g., "gt-abc123")
+		if strings.Contains(line, "-") && len(line) < 20 && len(line) > 3 {
+			return line
+		}
+	}
+
+	return output
+}
+
+// updateMRWithConflictTask updates the MR in the queue with the conflict task ID.
+func updateMRWithConflictTask(workDir, mrID, taskID string) {
+	// Use gt command to update MR metadata
+	cmd := exec.Command("gt", "mq", "update", mrID, "--conflict-task", taskID)
+	cmd.Dir = workDir
+	_ = cmd.Run() // Best-effort, don't fail if this doesn't work
 }

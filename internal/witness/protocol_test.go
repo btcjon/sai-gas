@@ -16,6 +16,8 @@ func TestClassifyMessage(t *testing.T) {
 		{"HELP: Git conflict", ProtoHelp},
 		{"MERGED nux", ProtoMerged},
 		{"MERGED valkyrie", ProtoMerged},
+		{"CONFLICT_DISPATCH mr-123-abc", ProtoConflictDispatch},
+		{"CONFLICT_DISPATCH mr-456", ProtoConflictDispatch},
 		{"🤝 HANDOFF: Patrol context", ProtoHandoff},
 		{"🤝HANDOFF: No space", ProtoHandoff},
 		{"SWARM_START", ProtoSwarmStart},
@@ -154,6 +156,54 @@ func TestParseMerged_InvalidSubject(t *testing.T) {
 	_, err := ParseMerged("Not merged", "body")
 	if err == nil {
 		t.Error("ParseMerged() expected error for invalid subject")
+	}
+}
+
+func TestParseConflictDispatch(t *testing.T) {
+	subject := "CONFLICT_DISPATCH mr-1234-abcd"
+	body := `Branch: polecat/Toast-abc123
+Target: main
+ConflictSHA: def456789
+SourceIssue: gt-xyz
+Worker: Toast
+Rig: gastown
+RetryCount: 2`
+
+	payload, err := ParseConflictDispatch(subject, body)
+	if err != nil {
+		t.Fatalf("ParseConflictDispatch() error = %v", err)
+	}
+
+	if payload.MRID != "mr-1234-abcd" {
+		t.Errorf("MRID = %q, want %q", payload.MRID, "mr-1234-abcd")
+	}
+	if payload.Branch != "polecat/Toast-abc123" {
+		t.Errorf("Branch = %q, want %q", payload.Branch, "polecat/Toast-abc123")
+	}
+	if payload.TargetBranch != "main" {
+		t.Errorf("TargetBranch = %q, want %q", payload.TargetBranch, "main")
+	}
+	if payload.ConflictSHA != "def456789" {
+		t.Errorf("ConflictSHA = %q, want %q", payload.ConflictSHA, "def456789")
+	}
+	if payload.SourceIssue != "gt-xyz" {
+		t.Errorf("SourceIssue = %q, want %q", payload.SourceIssue, "gt-xyz")
+	}
+	if payload.Worker != "Toast" {
+		t.Errorf("Worker = %q, want %q", payload.Worker, "Toast")
+	}
+	if payload.Rig != "gastown" {
+		t.Errorf("Rig = %q, want %q", payload.Rig, "gastown")
+	}
+	if payload.RetryCount != 2 {
+		t.Errorf("RetryCount = %d, want %d", payload.RetryCount, 2)
+	}
+}
+
+func TestParseConflictDispatch_InvalidSubject(t *testing.T) {
+	_, err := ParseConflictDispatch("Not a conflict dispatch", "body")
+	if err == nil {
+		t.Error("ParseConflictDispatch() expected error for invalid subject")
 	}
 }
 
