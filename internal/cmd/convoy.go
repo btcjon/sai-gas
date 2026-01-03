@@ -15,8 +15,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
+	convoylib "github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/style"
-	"github.com/steveyegge/gastown/internal/tui/convoy"
+	tuiconvoy "github.com/steveyegge/gastown/internal/tui/convoy"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -29,14 +30,15 @@ func generateShortID() string {
 
 // Convoy command flags
 var (
-	convoyMolecule    string
-	convoyNotify      string
-	convoyStatusJSON  bool
-	convoyListJSON    bool
-	convoyListStatus  string
-	convoyListAll     bool
-	convoyListTree    bool
-	convoyInteractive bool
+	convoyMolecule       string
+	convoyNotify         string
+	convoyStatusJSON     bool
+	convoyStatusStranded bool
+	convoyListJSON       bool
+	convoyListStatus     string
+	convoyListAll        bool
+	convoyListTree       bool
+	convoyInteractive    bool
 )
 
 var convoyCmd = &cobra.Command{
@@ -101,7 +103,20 @@ var convoyStatusCmd = &cobra.Command{
 	Long: `Show detailed status for a convoy.
 
 Displays convoy metadata, tracked issues, and completion progress.
-Without an ID, shows status of all active convoys.`,
+Without an ID, shows status of all active convoys.
+
+Stranded Detection:
+  Use --stranded to find convoys that have ready work but no polecats working on it.
+  A convoy is stranded if it has tracked issues where:
+    - status = open (not in_progress, not closed)
+    - not blocked (dependencies met)
+    - no assignee (or assignee session is dead)
+
+Examples:
+  gt convoy status                 # All active convoys
+  gt convoy status hq-cv-abc       # Specific convoy
+  gt convoy status --stranded      # Find stranded convoys
+  gt convoy status --stranded --json`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runConvoyStatus,
 }
@@ -134,6 +149,36 @@ Examples:
 	RunE: runConvoyAdd,
 }
 
+// Convoy feed flags
+var (
+	convoyFeedDryRun  bool
+	convoyFeedMax     int
+	convoyFeedRig     string
+	convoyFeedJSON    bool
+)
+
+var convoyFeedCmd = &cobra.Command{
+	Use:   "feed <convoy-id>",
+	Short: "Dispatch ready issues from a stranded convoy to idle polecats",
+	Long: `Feed a stranded convoy by dispatching ready issues to available polecats.
+
+This is a single-pass operation: it dispatches what it can and exits.
+The Deacon patrol loop handles repeated checking if the convoy remains stranded.
+
+Ready issues are those that are:
+  - status = open (not in_progress, not closed)
+  - not blocked (dependencies met)
+  - no assignee
+
+Examples:
+  gt convoy feed hq-cv-abc              # Feed all ready issues
+  gt convoy feed hq-cv-abc --max=2      # Feed at most 2 issues
+  gt convoy feed hq-cv-abc --rig=gastown # Only use polecats from gastown
+  gt convoy feed hq-cv-abc --dry-run    # Show what would be done`,
+	Args: cobra.ExactArgs(1),
+	RunE: runConvoyFeed,
+}
+
 func init() {
 	// Create flags
 	convoyCreateCmd.Flags().StringVar(&convoyMolecule, "molecule", "", "Associated molecule ID")
@@ -142,12 +187,19 @@ func init() {
 
 	// Status flags
 	convoyStatusCmd.Flags().BoolVar(&convoyStatusJSON, "json", false, "Output as JSON")
+	convoyStatusCmd.Flags().BoolVar(&convoyStatusStranded, "stranded", false, "Show stranded convoys (ready work, no workers)")
 
 	// List flags
 	convoyListCmd.Flags().BoolVar(&convoyListJSON, "json", false, "Output as JSON")
 	convoyListCmd.Flags().StringVar(&convoyListStatus, "status", "", "Filter by status (open, closed)")
 	convoyListCmd.Flags().BoolVar(&convoyListAll, "all", false, "Show all convoys (open and closed)")
 	convoyListCmd.Flags().BoolVar(&convoyListTree, "tree", false, "Show convoy with child issues in tree format")
+
+	// Feed flags
+	convoyFeedCmd.Flags().BoolVarP(&convoyFeedDryRun, "dry-run", "n", false, "Show what would be done without dispatching")
+	convoyFeedCmd.Flags().IntVar(&convoyFeedMax, "max", 0, "Maximum number of issues to dispatch (0 = unlimited)")
+	convoyFeedCmd.Flags().StringVar(&convoyFeedRig, "rig", "", "Only use polecats from this rig")
+	convoyFeedCmd.Flags().BoolVar(&convoyFeedJSON, "json", false, "Output as JSON")
 
 	// Interactive TUI flag (on parent command)
 	convoyCmd.Flags().BoolVarP(&convoyInteractive, "interactive", "i", false, "Interactive tree view")
@@ -157,6 +209,7 @@ func init() {
 	convoyCmd.AddCommand(convoyStatusCmd)
 	convoyCmd.AddCommand(convoyListCmd)
 	convoyCmd.AddCommand(convoyAddCmd)
+	convoyCmd.AddCommand(convoyFeedCmd)
 
 	rootCmd.AddCommand(convoyCmd)
 }
@@ -358,6 +411,11 @@ func runConvoyStatus(cmd *cobra.Command, args []string) error {
 	townBeads, err := getTownBeadsDir()
 	if err != nil {
 		return err
+	}
+
+	// Handle --stranded flag
+	if convoyStatusStranded {
+		return showStrandedConvoys(townBeads)
 	}
 
 	// If no ID provided, show all active convoys
@@ -998,7 +1056,7 @@ func runConvoyTUI() error {
 		return err
 	}
 
-	m := convoy.New(townBeads)
+	m := tuiconvoy.New(townBeads)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err = p.Run()
 	return err
@@ -1030,4 +1088,99 @@ func resolveConvoyNumber(townBeads string, n int) (string, error) {
 	}
 
 	return convoys[n-1].ID, nil
+}
+
+// showStrandedConvoys finds and displays convoys that have ready work but no workers.
+func showStrandedConvoys(townBeads string) error {
+	// Get town root from beads path
+	townRoot := filepath.Dir(townBeads)
+
+	stranded, err := convoylib.DetectStranded(townRoot)
+	if err != nil {
+		return fmt.Errorf("detecting stranded convoys: %w", err)
+	}
+
+	if convoyStatusJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(stranded)
+	}
+
+	if len(stranded) == 0 {
+		fmt.Printf("%s No stranded convoys.\n", style.Bold.Render("✓"))
+		fmt.Println("All convoys have workers or are waiting on blocked issues.")
+		return nil
+	}
+
+	fmt.Printf("%s Found %d stranded convoy(s):\n\n", style.Bold.Render("⚠"), len(stranded))
+
+	for _, sc := range stranded {
+		fmt.Printf("  🚚 %s: %s\n", style.Bold.Render(sc.ID), sc.Title)
+		fmt.Printf("     Ready issues (%d):\n", len(sc.ReadyIssues))
+		for _, issue := range sc.ReadyIssues {
+			fmt.Printf("       ○ %s: %s\n", issue.ID, issue.Title)
+		}
+		fmt.Println()
+	}
+
+	fmt.Printf("Use 'gt sling <issue-id> <rig>' to dispatch work to polecats.\n")
+
+	return nil
+}
+
+// runConvoyFeed dispatches ready issues from a stranded convoy to available polecats.
+func runConvoyFeed(cmd *cobra.Command, args []string) error {
+	convoyID := args[0]
+
+	townBeads, err := getTownBeadsDir()
+	if err != nil {
+		return err
+	}
+	townRoot := filepath.Dir(townBeads)
+
+	opts := convoylib.FeedOptions{
+		DryRun:    convoyFeedDryRun,
+		MaxSling:  convoyFeedMax,
+		TargetRig: convoyFeedRig,
+	}
+
+	result, err := convoylib.Feed(townRoot, convoyID, opts)
+	if err != nil {
+		return fmt.Errorf("feeding convoy: %w", err)
+	}
+
+	if convoyFeedJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(result)
+	}
+
+	// Human-readable output
+	if len(result.Dispatched) == 0 && len(result.Pending) == 0 {
+		fmt.Printf("%s Convoy %s has no ready issues to dispatch.\n", style.Dim.Render("○"), convoyID)
+		return nil
+	}
+
+	if len(result.Dispatched) > 0 {
+		fmt.Printf("%s Dispatched %d issue(s):\n", style.Bold.Render("✓"), len(result.Dispatched))
+		for _, id := range result.Dispatched {
+			fmt.Printf("  → %s\n", id)
+		}
+	}
+
+	if len(result.Pending) > 0 {
+		fmt.Printf("%s %d issue(s) pending (no available polecats):\n", style.Dim.Render("○"), len(result.Pending))
+		for _, id := range result.Pending {
+			fmt.Printf("  ○ %s\n", id)
+		}
+	}
+
+	if len(result.Errors) > 0 {
+		fmt.Printf("%s %d error(s):\n", style.Bold.Render("⚠"), len(result.Errors))
+		for _, e := range result.Errors {
+			fmt.Printf("  ✗ %s\n", e)
+		}
+	}
+
+	return nil
 }

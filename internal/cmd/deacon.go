@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/session"
@@ -210,6 +211,27 @@ Examples:
 	RunE: runDeaconZombieScan,
 }
 
+var deaconStrandedScanCmd = &cobra.Command{
+	Use:   "stranded-scan",
+	Short: "Scan for stranded convoys and optionally feed them",
+	Long: `Scan for stranded convoys - convoys with ready work but no workers.
+
+A convoy is stranded if it has tracked issues where:
+- status = open (not in_progress, not closed)
+- not blocked (dependencies met)
+- no assignee (or assignee session is dead)
+
+This command is part of the Deacon patrol loop. When stranded convoys are
+found, it can automatically dispatch ready issues to idle polecats.
+
+Examples:
+  gt deacon stranded-scan                # Check for stranded convoys
+  gt deacon stranded-scan --feed         # Feed stranded convoys
+  gt deacon stranded-scan --dry-run      # Preview only
+  gt deacon stranded-scan --json         # JSON output`,
+	RunE: runDeaconStrandedScan,
+}
+
 var (
 	triggerTimeout time.Duration
 
@@ -226,6 +248,11 @@ var (
 	zombieScanDryRun    bool
 	zombieScanThreshold time.Duration
 	zombieScanNuke      bool
+
+	// Stranded scan flags
+	strandedScanFeed   bool
+	strandedScanDryRun bool
+	strandedScanJSON   bool
 )
 
 func init() {
@@ -240,6 +267,7 @@ func init() {
 	deaconCmd.AddCommand(deaconForceKillCmd)
 	deaconCmd.AddCommand(deaconHealthStateCmd)
 	deaconCmd.AddCommand(deaconZombieScanCmd)
+	deaconCmd.AddCommand(deaconStrandedScanCmd)
 
 	// Flags for trigger-pending
 	deaconTriggerPendingCmd.Flags().DurationVar(&triggerTimeout, "timeout", 2*time.Second,
@@ -266,6 +294,14 @@ func init() {
 		"Staleness threshold for zombie detection")
 	deaconZombieScanCmd.Flags().BoolVar(&zombieScanNuke, "nuke", true,
 		"Nuke detected zombies (use --nuke=false to report only)")
+
+	// Flags for stranded-scan
+	deaconStrandedScanCmd.Flags().BoolVar(&strandedScanFeed, "feed", false,
+		"Automatically feed stranded convoys by dispatching to idle polecats")
+	deaconStrandedScanCmd.Flags().BoolVarP(&strandedScanDryRun, "dry-run", "n", false,
+		"Show what would be done without dispatching")
+	deaconStrandedScanCmd.Flags().BoolVar(&strandedScanJSON, "json", false,
+		"Output as JSON")
 
 	rootCmd.AddCommand(deaconCmd)
 }
@@ -1184,5 +1220,129 @@ func updateAgentBeadState(townRoot, agent, state, reason string) {
 	cmd := exec.Command("bd", "agent", "state", beadID, state)
 	cmd.Dir = townRoot
 	_ = cmd.Run() // Best effort
+}
+
+// runDeaconStrandedScan scans for stranded convoys and optionally feeds them.
+func runDeaconStrandedScan(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	// Detect stranded convoys
+	stranded, err := convoy.DetectStranded(townRoot)
+	if err != nil {
+		return fmt.Errorf("detecting stranded convoys: %w", err)
+	}
+
+	// JSON output
+	if strandedScanJSON {
+		type scanResult struct {
+			Stranded []convoy.StrandedConvoy `json:"stranded"`
+			Fed      []feedResultSummary     `json:"fed,omitempty"`
+		}
+		result := scanResult{Stranded: stranded}
+
+		if strandedScanFeed && len(stranded) > 0 {
+			result.Fed = feedStrandedConvoys(townRoot, stranded, strandedScanDryRun)
+		}
+
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(result)
+	}
+
+	// Human-readable output
+	if len(stranded) == 0 {
+		fmt.Printf("%s No stranded convoys.\n", style.Bold.Render("✓"))
+		return nil
+	}
+
+	fmt.Printf("%s Found %d stranded convoy(s):\n\n", style.Bold.Render("⚠"), len(stranded))
+
+	for _, sc := range stranded {
+		fmt.Printf("  🚚 %s: %s\n", style.Bold.Render(sc.ID), sc.Title)
+		fmt.Printf("     Ready issues (%d):\n", len(sc.ReadyIssues))
+		for _, issue := range sc.ReadyIssues {
+			fmt.Printf("       ○ %s: %s\n", issue.ID, issue.Title)
+		}
+		fmt.Println()
+	}
+
+	// Feed if requested
+	if strandedScanFeed {
+		fmt.Printf("%s Feeding stranded convoys...\n\n", style.Bold.Render("→"))
+		feedStrandedConvoysHuman(townRoot, stranded, strandedScanDryRun)
+	} else {
+		fmt.Printf("Use --feed to automatically dispatch to idle polecats.\n")
+	}
+
+	return nil
+}
+
+// feedResultSummary is a summary of feeding one convoy.
+type feedResultSummary struct {
+	ConvoyID   string   `json:"convoy_id"`
+	Dispatched int      `json:"dispatched"`
+	Pending    int      `json:"pending"`
+	Errors     int      `json:"errors"`
+}
+
+// feedStrandedConvoys feeds all stranded convoys and returns summaries.
+func feedStrandedConvoys(townRoot string, stranded []convoy.StrandedConvoy, dryRun bool) []feedResultSummary {
+	var results []feedResultSummary
+
+	for _, sc := range stranded {
+		opts := convoy.FeedOptions{
+			DryRun: dryRun,
+		}
+		result, err := convoy.Feed(townRoot, sc.ID, opts)
+		if err != nil {
+			results = append(results, feedResultSummary{
+				ConvoyID: sc.ID,
+				Errors:   1,
+			})
+			continue
+		}
+
+		results = append(results, feedResultSummary{
+			ConvoyID:   sc.ID,
+			Dispatched: len(result.Dispatched),
+			Pending:    len(result.Pending),
+			Errors:     len(result.Errors),
+		})
+	}
+
+	return results
+}
+
+// feedStrandedConvoysHuman feeds convoys with human-readable output.
+func feedStrandedConvoysHuman(townRoot string, stranded []convoy.StrandedConvoy, dryRun bool) {
+	for _, sc := range stranded {
+		opts := convoy.FeedOptions{
+			DryRun: dryRun,
+		}
+		result, err := convoy.Feed(townRoot, sc.ID, opts)
+		if err != nil {
+			fmt.Printf("  %s %s: %v\n", style.Bold.Render("✗"), sc.ID, err)
+			continue
+		}
+
+		if len(result.Dispatched) > 0 {
+			prefix := style.Bold.Render("✓")
+			if dryRun {
+				prefix = style.Dim.Render("[dry-run]")
+			}
+			fmt.Printf("  %s %s: dispatched %d issue(s)\n", prefix, sc.ID, len(result.Dispatched))
+		}
+
+		if len(result.Pending) > 0 {
+			fmt.Printf("  %s %s: %d issue(s) pending (no capacity)\n", style.Dim.Render("○"), sc.ID, len(result.Pending))
+		}
+
+		if len(result.Errors) > 0 {
+			fmt.Printf("  %s %s: %d error(s)\n", style.Bold.Render("⚠"), sc.ID, len(result.Errors))
+		}
+	}
 }
 
