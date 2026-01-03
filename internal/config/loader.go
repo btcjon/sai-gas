@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -714,6 +715,109 @@ func LoadRuntimeConfig(rigPath string) *RuntimeConfig {
 	return rc
 }
 
+// ClaudeUsage holds current Claude API usage percentages.
+type ClaudeUsage struct {
+	FiveHour  int `json:"five_hour"`
+	SevenDay  int `json:"seven_day"`
+	Effective int `json:"effective"` // Pace-adjusted threshold
+}
+
+// GetClaudeUsage fetches current Claude usage percentages by calling the usage script.
+// Returns nil and error if the script fails or returns invalid data.
+func GetClaudeUsage() (*ClaudeUsage, error) {
+	script := filepath.Join(os.Getenv("HOME"), ".claude/scripts/usage-fetchers/claude-usage.sh")
+	cmd := exec.Command(script, "--json")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("running usage script: %w", err)
+	}
+	var result ClaudeUsage
+	if err := json.Unmarshal(out, &result); err != nil {
+		return nil, fmt.Errorf("parsing usage data: %w", err)
+	}
+	return &result, nil
+}
+
+// RuntimeSelection holds the selected runtime and reason for the selection.
+type RuntimeSelection struct {
+	Command string   // "claude" or "zcc"
+	Args    []string // May include "--model haiku"
+	Reason  string   // For logging/debugging
+}
+
+// SelectRuntime chooses the appropriate runtime based on current Claude usage.
+// Returns the base config unchanged if routing is disabled or usage check fails.
+func SelectRuntime(baseRC *RuntimeConfig) *RuntimeSelection {
+	// Check if routing is disabled
+	if os.Getenv("GT_DISABLE_USAGE_ROUTING") == "1" {
+		return &RuntimeSelection{
+			Command: baseRC.Command,
+			Args:    baseRC.Args,
+			Reason:  "routing disabled",
+		}
+	}
+
+	// Get current usage
+	usage, err := GetClaudeUsage()
+	if err != nil {
+		// Default to base config on error
+		return &RuntimeSelection{
+			Command: baseRC.Command,
+			Args:    baseRC.Args,
+			Reason:  fmt.Sprintf("usage check failed: %v", err),
+		}
+	}
+
+	// Use the higher of 5-hour or 7-day usage
+	maxUsage := usage.FiveHour
+	if usage.SevenDay > maxUsage {
+		maxUsage = usage.SevenDay
+	}
+
+	// Default effective threshold if not set
+	effectiveThreshold := usage.Effective
+	if effectiveThreshold == 0 {
+		effectiveThreshold = 50
+	}
+
+	// 70%+ → ZCC (separate quota)
+	if maxUsage >= 70 {
+		return &RuntimeSelection{
+			Command: "zcc",
+			Args:    baseRC.Args, // Same args work (ZCC is a Claude wrapper)
+			Reason:  fmt.Sprintf("usage %d%% >= 70%%, using ZCC", maxUsage),
+		}
+	}
+
+	// >= effective threshold → Haiku
+	if maxUsage >= effectiveThreshold {
+		args := make([]string, len(baseRC.Args))
+		copy(args, baseRC.Args)
+		hasModel := false
+		for _, arg := range args {
+			if strings.HasPrefix(arg, "--model") {
+				hasModel = true
+				break
+			}
+		}
+		if !hasModel {
+			args = append(args, "--model", "haiku")
+		}
+		return &RuntimeSelection{
+			Command: baseRC.Command,
+			Args:    args,
+			Reason:  fmt.Sprintf("usage %d%% >= %d%%, using Haiku", maxUsage, effectiveThreshold),
+		}
+	}
+
+	// < threshold → Default (Opus)
+	return &RuntimeSelection{
+		Command: baseRC.Command,
+		Args:    baseRC.Args,
+		Reason:  fmt.Sprintf("usage %d%% < %d%%, using default", maxUsage, effectiveThreshold),
+	}
+}
+
 // GetRuntimeCommand is a convenience function that returns the full command string
 // for starting an LLM session. It loads the config and builds the command.
 func GetRuntimeCommand(rigPath string) string {
@@ -735,6 +839,15 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 		rc = LoadRuntimeConfig(rigPath)
 	} else {
 		rc = DefaultRuntimeConfig()
+	}
+
+	// Usage-aware routing: select runtime based on current usage
+	// Only applies when base command is "claude"
+	if rc.Command == "claude" {
+		selection := SelectRuntime(rc)
+		rc.Command = selection.Command
+		rc.Args = selection.Args
+		// Note: selection.Reason can be used for debugging if needed
 	}
 
 	// Build environment export prefix

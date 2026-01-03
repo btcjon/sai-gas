@@ -998,3 +998,80 @@ func TestLoadRuntimeConfigFallsBackToDefaults(t *testing.T) {
 		t.Errorf("Command = %q, want %q (default)", rc.Command, "claude")
 	}
 }
+
+func TestSelectRuntimeDisabled(t *testing.T) {
+	// Set env var to disable routing
+	os.Setenv("GT_DISABLE_USAGE_ROUTING", "1")
+	defer os.Unsetenv("GT_DISABLE_USAGE_ROUTING")
+
+	rc := &RuntimeConfig{
+		Command: "claude",
+		Args:    []string{"--dangerously-skip-permissions"},
+	}
+
+	selection := SelectRuntime(rc)
+
+	if selection.Command != "claude" {
+		t.Errorf("Command = %q, want %q (routing disabled)", selection.Command, "claude")
+	}
+	if selection.Reason != "routing disabled" {
+		t.Errorf("Reason = %q, want %q", selection.Reason, "routing disabled")
+	}
+}
+
+func TestSelectRuntimeWithNonClaudeCommand(t *testing.T) {
+	// Non-claude commands should not be modified
+	// (this is tested via BuildStartupCommand which only calls SelectRuntime for claude)
+	rc := &RuntimeConfig{
+		Command: "aider",
+		Args:    []string{"--no-git"},
+	}
+
+	// SelectRuntime is only called for claude commands in BuildStartupCommand,
+	// but if called directly it should still work
+	os.Unsetenv("GT_DISABLE_USAGE_ROUTING")
+	selection := SelectRuntime(rc)
+
+	// Even if usage check fails, it returns the base config
+	if selection.Command != "aider" {
+		t.Errorf("Command = %q, want %q (non-claude should pass through)", selection.Command, "aider")
+	}
+}
+
+func TestSelectRuntimeUsageCheckFails(t *testing.T) {
+	// When usage script doesn't exist or fails, should fallback to default
+	os.Unsetenv("GT_DISABLE_USAGE_ROUTING")
+
+	// Temporarily override HOME to make script not found
+	oldHome := os.Getenv("HOME")
+	os.Setenv("HOME", "/nonexistent")
+	defer os.Setenv("HOME", oldHome)
+
+	rc := &RuntimeConfig{
+		Command: "claude",
+		Args:    []string{"--dangerously-skip-permissions"},
+	}
+
+	selection := SelectRuntime(rc)
+
+	if selection.Command != "claude" {
+		t.Errorf("Command = %q, want %q (fallback on error)", selection.Command, "claude")
+	}
+	if !strings.Contains(selection.Reason, "usage check failed") {
+		t.Errorf("Reason = %q, want to contain 'usage check failed'", selection.Reason)
+	}
+}
+
+func TestBuildStartupCommandUsageRouting(t *testing.T) {
+	// This tests that BuildStartupCommand integrates SelectRuntime
+	// When routing is disabled, should use default claude command
+	os.Setenv("GT_DISABLE_USAGE_ROUTING", "1")
+	defer os.Unsetenv("GT_DISABLE_USAGE_ROUTING")
+
+	cmd := BuildStartupCommand(nil, "", "")
+
+	// Should contain claude (not zcc or haiku) when routing disabled
+	if !strings.Contains(cmd, "claude") {
+		t.Error("expected claude command when routing disabled")
+	}
+}
