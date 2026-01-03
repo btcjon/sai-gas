@@ -1324,12 +1324,16 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 			})
 		}
 	} else {
-		// Multiple rig/polecat arguments
+		// Multiple rig/polecat arguments - require explicit rig/polecat format
 		for _, arg := range args {
-			rigName, polecatName, err := parseAddress(arg)
-			if err != nil {
-				return fmt.Errorf("invalid address '%s': %w", arg, err)
+			// Require explicit rig/polecat format (no bare names)
+			parts := strings.SplitN(arg, "/", 2)
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				return fmt.Errorf("invalid address '%s': must be in format 'rig/polecat' (e.g., 'greenplace/Toast')", arg)
 			}
+
+			rigName := parts[0]
+			polecatName := parts[1]
 
 			mgr, r, err := getPolecatManager(rigName)
 			if err != nil {

@@ -1107,7 +1107,7 @@ func nukeZombie(townRoot string, z zombieInfo, t *tmux.Tmux) error {
 	}
 
 	// Step 2: Run gt polecat nuke to clean up
-	cmd := exec.Command("gt", "polecat", "nuke", z.name, "--rig="+z.rig, "--force")
+	cmd := exec.Command("gt", "polecat", "nuke", z.rig+"/"+z.name, "--force")
 	cmd.Dir = townRoot
 	if err := cmd.Run(); err != nil {
 		// Non-fatal - polecat might already be cleaned up
