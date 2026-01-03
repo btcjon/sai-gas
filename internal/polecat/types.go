@@ -12,8 +12,15 @@ const (
 	// This is the initial and primary state for transient polecats.
 	StateWorking State = "working"
 
+	// StateRecyclable means the polecat has submitted its MR and is ready
+	// for cleanup. This is the ephemeral exit state set by `gt done --exit COMPLETED`.
+	// The polecat has pushed all work to origin and can be safely nuked.
+	// The Witness will nuke the polecat once the MERGED signal is received.
+	StateRecyclable State = "recyclable"
+
 	// StateDone means the polecat has completed its assigned work
 	// and is ready for cleanup by the Witness.
+	// Deprecated: use StateRecyclable for ephemeral polecats
 	StateDone State = "done"
 
 	// StateStuck means the polecat needs assistance.
@@ -35,6 +42,13 @@ func (s State) IsWorking() bool {
 // legacy idle/active states (treated as working).
 func (s State) IsActive() bool {
 	return s == StateWorking || s == StateIdle || s == StateActive
+}
+
+// IsRecyclable returns true if the polecat has submitted its MR
+// and is ready to be nuked. This is the clean exit state for
+// ephemeral polecats.
+func (s State) IsRecyclable() bool {
+	return s == StateRecyclable
 }
 
 // Polecat represents a worker agent in a rig.

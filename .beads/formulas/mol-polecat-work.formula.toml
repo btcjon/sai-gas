@@ -374,21 +374,29 @@ git diff origin/main...HEAD # Your changes (expected)
 **Exit criteria:** Branch pushed, workspace clean, no cruft."""
 
 [[steps]]
-id = "close-issue"
-title = "Close the assigned issue"
+id = "submit-mr"
+title = "Submit to merge queue"
 needs = ["cleanup-workspace"]
 description = """
-Mark the issue as complete in beads.
+Submit your work to the merge queue and signal completion.
 
-**1. Close with a summary:**
+**1. Use gt done to submit MR and signal recyclable:**
 ```bash
-bd close {{issue}} --reason "Implemented: <brief summary of what was done>"
+gt done --issue {{issue}}
 ```
 
-**2. Verify closure:**
+This command:
+- Verifies branch is pushed to origin (CRITICAL - must happen before polecat is nuked)
+- Creates MR bead in the merge queue
+- Sets issue status to 'in_review' (not closed - work isn't done until merged)
+- Updates agent_state to 'recyclable' (signals Witness you're ready for cleanup)
+- Sends POLECAT_DONE notification to Witness
+- Reports cleanup_status for ZFC compliance
+
+**2. Verify the MR was created:**
 ```bash
-bd show {{issue}}
-# Status should show 'closed'
+gt mq status
+# Should show your MR in pending queue
 ```
 
 **3. Sync beads:**
@@ -396,40 +404,40 @@ bd show {{issue}}
 bd sync
 ```
 
-**Exit criteria:** Issue closed in beads, synced to remote."""
+**Exit criteria:** MR submitted, issue in_review, agent recyclable."""
 
 [[steps]]
-id = "signal-complete"
-title = "Signal completion to Witness"
-needs = ["close-issue"]
+id = "wait-for-cleanup"
+title = "Wait for Witness cleanup"
+needs = ["submit-mr"]
 description = """
-Notify Witness you're done and wait for termination.
+Wait for the Witness to clean up your polecat.
 
-**1. Update your agent state:**
-```bash
-# Your agent bead should reflect completion
-gt mol done                 # Or equivalent command
-```
+**What happens now:**
 
-**2. Send POLECAT_DONE mail:**
-```bash
-gt mail send <rig>/witness -s "POLECAT_DONE $(hostname)" -m "Exit: MERGED
-Issue: {{issue}}
-Branch: $(git branch --show-current)
-Commits: $(git log --oneline origin/main..HEAD | wc -l | tr -d ' ')
+1. You've signaled 'recyclable' - Witness knows you're done
+2. Witness creates cleanup wisp to track your polecat
+3. Refinery processes your MR (merge/rebase/reject)
+4. On MERGED signal, Witness nukes your polecat worktree
 
-Work complete. Ready for merge queue."
-```
+**Your responsibilities are complete:**
+- Branch is pushed to origin (verified by gt done)
+- MR is in the queue
+- Issue is marked in_review
+- You're recyclable
 
-**3. WAIT FOR WITNESS:**
+**WAIT FOR WITNESS:**
 Do NOT exit or kill your session. The Witness will:
-1. Verify your git state is clean
-2. Send MERGE_READY to Refinery
-3. Wait for MERGED confirmation
-4. Kill your session
+1. Verify cleanup_status is 'clean'
+2. Wait for MERGED confirmation from Refinery
+3. Nuke your polecat worktree (kills your session)
 
-You may see a ~30-60 second delay while this happens.
-If you don't get killed within 5 minutes, mail Witness again.
+You may see a delay while the MR is processed and merged.
+If you don't get killed within 10 minutes, check:
+```bash
+gt mq status              # Is your MR still pending?
+gt mail inbox             # Any rejection notices?
+```
 
 **CRITICAL:** Do not exit yourself. Do not run `exit`. Just wait.
 

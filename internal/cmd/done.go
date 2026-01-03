@@ -128,7 +128,9 @@ func runDone(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("cannot submit main/master branch to merge queue")
 		}
 
-		// Check for unpushed commits - branch must be pushed before MR creation
+		// CRITICAL: Ensure branch is pushed before MR creation
+		// This is required for the ephemeral polecat model - once the polecat signals
+		// recyclable, the Witness may nuke the worktree. The branch must be on origin.
 		// Use BranchPushedToRemote which handles polecat branches without upstream tracking
 		pushed, unpushedCount, err := g.BranchPushedToRemote(branch, "origin")
 		if err != nil {
@@ -231,6 +233,18 @@ func runDone(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Priority: P%d\n", priority)
 		fmt.Println()
 		fmt.Printf("%s\n", style.Dim.Render("The Refinery will process your merge request."))
+
+		// Set work bead status to "in_review" - it's not done until merged
+		// This is part of the ephemeral polecat model: polecat signals recyclable,
+		// but the work itself is still pending merge approval
+		if issueID != "" {
+			inReview := "in_review"
+			if err := bd.Update(issueID, beads.UpdateOptions{Status: &inReview}); err != nil {
+				style.PrintWarning("could not update issue status to in_review: %v", err)
+			} else {
+				fmt.Printf("%s Issue %s marked as in_review\n", style.Bold.Render("✓"), issueID)
+			}
+		}
 	} else {
 		// For ESCALATED or DEFERRED, just print status
 		fmt.Printf("%s Signaling %s\n", style.Bold.Render("→"), exitType)
@@ -282,9 +296,12 @@ func runDone(cmd *cobra.Command, args []string) error {
 
 // updateAgentStateOnDone updates the agent bead state when work is complete.
 // Maps exit type to agent state:
-//   - COMPLETED → "done"
+//   - COMPLETED → "recyclable" (MR submitted, polecat can be nuked after merge)
 //   - ESCALATED → "stuck"
 //   - DEFERRED → "idle"
+//
+// The "recyclable" state signals to Witness that this polecat is safe to nuke
+// once the MERGED signal is received. This is part of the ephemeral polecat model.
 //
 // Also self-reports cleanup_status for ZFC compliance (#10).
 func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
@@ -311,7 +328,9 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 	var newState string
 	switch exitType {
 	case ExitCompleted:
-		newState = "done"
+		// "recyclable" signals to Witness that this polecat has submitted its MR
+		// and can be nuked once the merge is confirmed. The branch is already pushed.
+		newState = "recyclable"
 	case ExitEscalated:
 		newState = "stuck"
 	case ExitDeferred:

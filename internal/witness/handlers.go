@@ -433,6 +433,67 @@ type agentBeadResponse struct {
 	Description string `json:"description"`
 }
 
+// agentBeadInfo contains parsed info from an agent bead's description.
+type agentBeadInfo struct {
+	CleanupStatus string // clean, has_uncommitted, has_stash, has_unpushed
+	AgentState    string // spawning, working, recyclable, done, stuck, idle
+}
+
+// getAgentBeadInfo retrieves both cleanup_status and agent_state from a polecat's agent bead.
+// Returns empty struct fields if agent bead doesn't exist or fields are missing.
+func getAgentBeadInfo(workDir, rigName, polecatName string) agentBeadInfo {
+	info := agentBeadInfo{}
+
+	// Construct agent bead ID using the rig's configured prefix
+	townRoot, err := workspace.Find(workDir)
+	if err != nil || townRoot == "" {
+		townRoot = workDir
+	}
+	prefix := beads.GetPrefixForRig(townRoot, rigName)
+	agentBeadID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
+
+	cmd := exec.Command("bd", "show", agentBeadID, "--json")
+	cmd.Dir = workDir
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return info
+	}
+
+	output := stdout.Bytes()
+	if len(output) == 0 {
+		return info
+	}
+
+	var resp agentBeadResponse
+	if err := json.Unmarshal(output, &resp); err != nil {
+		return info
+	}
+
+	// Parse fields from description
+	for _, line := range strings.Split(resp.Description, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(line), "cleanup_status:") {
+			value := strings.TrimSpace(strings.TrimPrefix(line, "cleanup_status:"))
+			value = strings.TrimSpace(strings.TrimPrefix(value, "Cleanup_status:"))
+			if value != "" && value != "null" {
+				info.CleanupStatus = value
+			}
+		} else if strings.HasPrefix(strings.ToLower(line), "agent_state:") {
+			value := strings.TrimSpace(strings.TrimPrefix(line, "agent_state:"))
+			value = strings.TrimSpace(strings.TrimPrefix(value, "Agent_state:"))
+			if value != "" && value != "null" {
+				info.AgentState = value
+			}
+		}
+	}
+
+	return info
+}
+
 // getCleanupStatus retrieves the cleanup_status from a polecat's agent bead.
 // Returns the status string: "clean", "has_uncommitted", "has_stash", "has_unpushed"
 // Returns empty string if agent bead doesn't exist or has no cleanup_status.
@@ -648,29 +709,39 @@ type NukePolecatResult struct {
 }
 
 // AutoNukeIfClean checks if a polecat is safe to nuke and nukes it if so.
-// This is used for idle polecats with no pending MR - they can be nuked immediately.
+// This is used for idle/recyclable polecats with no pending MR - they can be nuked immediately.
+//
+// The "recyclable" agent_state (set by `gt done --exit COMPLETED`) indicates the polecat
+// has submitted its MR and pushed all work to origin. Combined with cleanup_status=clean,
+// this signals it's safe to nuke the polecat worktree.
+//
 // Returns whether the nuke was performed and any error.
 func AutoNukeIfClean(workDir, rigName, polecatName string) *NukePolecatResult {
 	result := &NukePolecatResult{}
 
-	// Check cleanup_status from agent bead
-	cleanupStatus := getCleanupStatus(workDir, rigName, polecatName)
+	// Get both agent_state and cleanup_status from agent bead
+	info := getAgentBeadInfo(workDir, rigName, polecatName)
 
-	switch cleanupStatus {
+	switch info.CleanupStatus {
 	case "clean":
-		// Safe to nuke
+		// Safe to nuke - git state is clean
 		if err := NukePolecat(workDir, rigName, polecatName); err != nil {
 			result.Error = err
 			result.Reason = fmt.Sprintf("nuke failed: %v", err)
 		} else {
 			result.Nuked = true
-			result.Reason = "auto-nuked (cleanup_status=clean, no MR)"
+			// Include agent_state in reason for observability
+			if info.AgentState == "recyclable" {
+				result.Reason = "auto-nuked (recyclable polecat, cleanup_status=clean)"
+			} else {
+				result.Reason = fmt.Sprintf("auto-nuked (cleanup_status=clean, agent_state=%s)", info.AgentState)
+			}
 		}
 
 	case "has_uncommitted", "has_stash", "has_unpushed":
 		// Not safe - has work that could be lost
 		result.Skipped = true
-		result.Reason = fmt.Sprintf("skipped: has %s", strings.TrimPrefix(cleanupStatus, "has_"))
+		result.Reason = fmt.Sprintf("skipped: has %s", strings.TrimPrefix(info.CleanupStatus, "has_"))
 
 	default:
 		// Unknown status - check git state directly as fallback
