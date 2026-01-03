@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 
@@ -8,6 +9,10 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
+)
+
+var (
+	whoamiJSON bool
 )
 
 var whoamiCmd = &cobra.Command{
@@ -30,17 +35,34 @@ Examples:
 }
 
 func init() {
+	whoamiCmd.Flags().BoolVar(&whoamiJSON, "json", false, "Output as JSON")
 	rootCmd.AddCommand(whoamiCmd)
 }
 
 func runWhoami(cmd *cobra.Command, args []string) error {
 	// Get current identity using same logic as mail commands
 	identity := detectSender()
+	gtRole := os.Getenv("GT_ROLE")
+
+	if whoamiJSON {
+		res := map[string]string{
+			"identity": identity,
+			"role":     gtRole,
+		}
+		if gtRole == "" && identity == "overseer" {
+			res["role"] = "overseer"
+		}
+		data, err := json.MarshalIndent(res, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(data))
+		return nil
+	}
 
 	fmt.Printf("%s %s\n", style.Bold.Render("Identity:"), identity)
 
 	// Show how it was determined
-	gtRole := os.Getenv("GT_ROLE")
 	if gtRole != "" {
 		fmt.Printf("%s GT_ROLE=%s\n", style.Dim.Render("Source:"), gtRole)
 
