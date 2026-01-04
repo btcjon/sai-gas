@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
@@ -28,13 +29,20 @@ var stopCmd = &cobra.Command{
 	Short:   "Emergency stop for sessions",
 	Long: `Emergency stop command for Gas Town sessions.
 
-Stops all running polecat sessions across rigs. Use for emergency shutdown
-when you need to halt all agent activity immediately.
+Stops all running polecat sessions across rigs. By default, runs pre-shutdown
+checks on each session to ensure it's in a safe state (clean git, all commits
+pushed, beads synced, no hooked work).
+
+Use --graceful to attempt graceful shutdown (Ctrl-C) before killing.
+Note that pre-shutdown checks still run unless --graceful is NOT used.
 
 Examples:
-  gt stop --all              # Kill ALL sessions across all rigs
-  gt stop --rig wyvern       # Kill all sessions in the wyvern rig
-  gt stop --all --graceful   # Try graceful shutdown first`,
+  gt stop --all              # Kill all sessions (with safety checks)
+  gt stop --rig wyvern       # Kill sessions in wyvern (with safety checks)
+  gt stop --all --graceful   # Graceful shutdown with safety checks
+
+For emergency situations where safety checks must be skipped, modify the
+session Manager.Stop() call with a force flag if needed.`,
 	RunE: runStop,
 }
 
@@ -52,6 +60,18 @@ type StopResult struct {
 	SessionID string
 	Success   bool
 	Error     string
+}
+
+// formatMultilineError indents multiline error messages for readability.
+func formatMultilineError(errMsg string) string {
+	lines := strings.Split(errMsg, "\n")
+	var formatted []string
+	for _, line := range lines {
+		if line != "" {
+			formatted = append(formatted, line)
+		}
+	}
+	return strings.Join(formatted, "\n     ")
 }
 
 func runStop(cmd *cobra.Command, args []string) error {
@@ -105,6 +125,12 @@ func runStop(cmd *cobra.Command, args []string) error {
 			style.Bold.Render("🛑"), stopRig)
 	}
 
+	// When not forcing, warn about pre-shutdown checks
+	if !force && stopAll {
+		fmt.Printf("%s Pre-shutdown checks will be run for each session\n\n",
+			style.Dim.Render("ℹ"))
+	}
+
 	// Stop sessions in each rig
 	t := tmux.NewTmux()
 	var results []StopResult
@@ -132,10 +158,11 @@ func runStop(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				result.Success = false
 				result.Error = err.Error()
-				fmt.Printf("  %s [%s] %s: %s\n",
+				fmt.Printf("  %s [%s] %s:\n",
 					style.Dim.Render("✗"),
-					r.Name, info.Polecat,
-					style.Dim.Render(err.Error()))
+					r.Name, info.Polecat)
+				// Print the full error (may be multi-line with details)
+				fmt.Printf("     %s\n", formatMultilineError(err.Error()))
 			} else {
 				result.Success = true
 				stopped++

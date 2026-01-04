@@ -67,8 +67,18 @@ var sessionStopCmd = &cobra.Command{
 	Short: "Stop a polecat session",
 	Long: `Stop a running polecat session.
 
-Attempts graceful shutdown first (Ctrl-C), then kills the tmux session.
-Use --force to skip graceful shutdown.`,
+By default, performs pre-shutdown checks to ensure the session is in a safe state:
+  1. Git working tree clean (no uncommitted changes)
+  2. All commits pushed (no local-only commits)
+  3. Beads synced (no uncommitted bead changes)
+  4. No assigned hooked work
+
+If checks fail, the stop command will error with details. Fix the issues or use
+--force to skip checks and kill immediately.
+
+Examples:
+  gt session stop wyvern/Toast         # Stop with safety checks
+  gt session stop wyvern/Toast --force # Force kill without checks`,
 	Args: cobra.ExactArgs(1),
 	RunE: runSessionStop,
 }
@@ -299,7 +309,9 @@ func runSessionStop(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Force stopping session for %s/%s...\n", rigName, polecatName)
 	} else {
 		fmt.Printf("Stopping session for %s/%s...\n", rigName, polecatName)
+		fmt.Printf("%s Running pre-shutdown checks...\n", style.Dim.Render("▪"))
 	}
+
 	if err := mgr.Stop(polecatName, sessionForce); err != nil {
 		return fmt.Errorf("stopping session: %w", err)
 	}

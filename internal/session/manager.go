@@ -221,7 +221,8 @@ func (m *Manager) Start(polecat string, opts StartOptions) error {
 }
 
 // Stop terminates a polecat session.
-// If force is true, skips graceful shutdown and kills immediately.
+// If force is true, skips pre-shutdown checks and kills immediately.
+// If force is false, runs pre-shutdown checks and returns an error if checks fail.
 func (m *Manager) Stop(polecat string, force bool) error {
 	sessionID := m.SessionName(polecat)
 
@@ -234,10 +235,28 @@ func (m *Manager) Stop(polecat string, force bool) error {
 		return ErrSessionNotFound
 	}
 
+	polecatDir := m.polecatDir(polecat)
+
+	// Run pre-shutdown checks unless forced
+	if !force {
+		checks := m.RunPreShutdownChecks(polecatDir)
+		if !checks.AllChecksPassed {
+			// Build error message with all failures
+			var errMsg strings.Builder
+			errMsg.WriteString("Cannot stop session - pre-shutdown checks failed:\n\n")
+			for _, e := range checks.Errors {
+				errMsg.WriteString(e)
+				errMsg.WriteString("\n\n")
+			}
+			errMsg.WriteString("Fix the issues above, or use --force to skip checks:\n")
+			errMsg.WriteString("  gt session stop " + polecat + " --force")
+			return fmt.Errorf("%s", errMsg.String())
+		}
+	}
+
 	// Sync beads before shutdown to preserve any changes
 	// Run in the polecat's worktree directory
 	if !force {
-		polecatDir := m.polecatDir(polecat)
 		if err := m.syncBeads(polecatDir); err != nil {
 			// Non-fatal - log and continue with shutdown
 			fmt.Printf("Warning: beads sync failed: %v\n", err)
@@ -263,6 +282,184 @@ func (m *Manager) syncBeads(workDir string) error {
 	cmd := exec.Command("bd", "sync")
 	cmd.Dir = workDir
 	return cmd.Run()
+}
+
+// PreShutdownCheckResult contains the results of pre-shutdown verification.
+type PreShutdownCheckResult struct {
+	// AllChecksPassed indicates if all checks passed.
+	AllChecksPassed bool
+
+	// Individual check results
+	GitWorkingTreeClean bool
+	AllCommitsPushed    bool
+	BeadsSynced         bool
+	NoHookedWork        bool
+
+	// Error details for human consumption
+	Errors []string
+}
+
+// RunPreShutdownChecks verifies the working directory is in a safe state before shutdown.
+// Checks:
+// 1. Git working tree clean (no uncommitted changes)
+// 2. All commits pushed (no local-only commits)
+// 3. Beads synced (no uncommitted bead changes)
+// 4. No assigned hooked work (or work is completed)
+func (m *Manager) RunPreShutdownChecks(polecatDir string) *PreShutdownCheckResult {
+	result := &PreShutdownCheckResult{
+		AllChecksPassed: true,
+	}
+
+	// 1. Check git working tree is clean
+	if err := m.checkGitClean(polecatDir, result); err != nil {
+		result.AllChecksPassed = false
+	}
+
+	// 2. Check all commits are pushed
+	if err := m.checkCommitsPushed(polecatDir, result); err != nil {
+		result.AllChecksPassed = false
+	}
+
+	// 3. Check beads are synced
+	if err := m.checkBeadsSynced(polecatDir, result); err != nil {
+		result.AllChecksPassed = false
+	}
+
+	// 4. Check no hooked work
+	if err := m.checkNoHookedWork(polecatDir, result); err != nil {
+		result.AllChecksPassed = false
+	}
+
+	return result
+}
+
+// checkGitClean verifies the git working directory has no uncommitted changes.
+func (m *Manager) checkGitClean(workDir string, result *PreShutdownCheckResult) error {
+	cmd := exec.Command("git", "status", "--porcelain")
+	cmd.Dir = workDir
+	output, err := cmd.Output()
+	if err != nil {
+		// Not a git repo or git not available - not a hard error
+		result.GitWorkingTreeClean = true
+		return nil
+	}
+
+	status := strings.TrimSpace(string(output))
+	if status == "" {
+		result.GitWorkingTreeClean = true
+		return nil
+	}
+
+	result.GitWorkingTreeClean = false
+	result.Errors = append(result.Errors, "Uncommitted changes in git working tree:\n"+formatGitStatus(status))
+	return fmt.Errorf("git working tree not clean")
+}
+
+// checkCommitsPushed verifies all local commits are pushed to remote.
+func (m *Manager) checkCommitsPushed(workDir string, result *PreShutdownCheckResult) error {
+	// First get current branch
+	branchCmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
+	branchCmd.Dir = workDir
+	branchOutput, err := branchCmd.Output()
+	if err != nil {
+		// Not a git repo or git not available
+		result.AllCommitsPushed = true
+		return nil
+	}
+
+	branch := strings.TrimSpace(string(branchOutput))
+	if branch == "" || branch == "HEAD" {
+		// Detached HEAD or special case - assume OK
+		result.AllCommitsPushed = true
+		return nil
+	}
+
+	// Check for unpushed commits
+	// Try upstream first, fall back to origin/branch
+	unpushedCmd := exec.Command("git", "log", "--oneline", "@{u}..HEAD")
+	unpushedCmd.Dir = workDir
+	unpushedOutput, _ := unpushedCmd.Output()
+
+	if unpushedOutput == nil || len(unpushedOutput) == 0 {
+		// Try fallback: origin/branch
+		unpushedCmd = exec.Command("git", "log", "--oneline", fmt.Sprintf("origin/%s..HEAD", branch))
+		unpushedCmd.Dir = workDir
+		unpushedOutput, _ = unpushedCmd.Output()
+	}
+
+	unpushed := strings.TrimSpace(string(unpushedOutput))
+	if unpushed == "" {
+		result.AllCommitsPushed = true
+		return nil
+	}
+
+	result.AllCommitsPushed = false
+	result.Errors = append(result.Errors, fmt.Sprintf("Unpushed commits on %s:\n%s", branch, unpushed))
+	return fmt.Errorf("unpushed commits found")
+}
+
+// checkBeadsSynced verifies beads have been synced (bd sync check).
+func (m *Manager) checkBeadsSynced(workDir string, result *PreShutdownCheckResult) error {
+	// Run bd sync --check (non-fatal if bd not available)
+	cmd := exec.Command("bd", "sync", "--check")
+	cmd.Dir = workDir
+	err := cmd.Run()
+	if err != nil {
+		// Check if bd is available
+		if _, pathErr := exec.LookPath("bd"); pathErr != nil {
+			// bd not available - not a hard error
+			result.BeadsSynced = true
+			return nil
+		}
+
+		// bd available but check failed
+		result.BeadsSynced = false
+		result.Errors = append(result.Errors, "Beads not synced. Run: bd sync")
+		return fmt.Errorf("beads not synced")
+	}
+
+	result.BeadsSynced = true
+	return nil
+}
+
+// checkNoHookedWork verifies there's no work hooked to this polecat (or work is completed).
+func (m *Manager) checkNoHookedWork(workDir string, result *PreShutdownCheckResult) error {
+	// Run gt hook to check for hooked work
+	// This is informational - we allow stopping even with hooked work
+	// but warn the user
+	cmd := exec.Command("gt", "hook")
+	cmd.Dir = workDir
+	output, _ := cmd.Output()
+
+	hook := strings.TrimSpace(string(output))
+	if hook == "" || strings.Contains(hook, "no work hooked") {
+		result.NoHookedWork = true
+		return nil
+	}
+
+	// Has hooked work - still allowed to stop, but warn
+	result.NoHookedWork = false
+	result.Errors = append(result.Errors, fmt.Sprintf("Work hooked to this polecat:\n%s\nConsider completing or unhoking first", hook))
+	// Note: not a fatal error for pre-shutdown checks
+	return nil
+}
+
+// formatGitStatus formats git status porcelain output for human consumption.
+func formatGitStatus(status string) string {
+	lines := strings.Split(status, "\n")
+	var formatted []string
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		// Format: "XY filename"
+		if len(line) > 3 {
+			code := line[:2]
+			file := line[3:]
+			formatted = append(formatted, fmt.Sprintf("  %s %s", code, file))
+		}
+	}
+	return strings.Join(formatted, "\n")
 }
 
 // IsRunning checks if a polecat session is active.
