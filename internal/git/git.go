@@ -252,6 +252,20 @@ func (g *Git) MergeNoFF(branch, message string) error {
 	return err
 }
 
+// DiffFiles returns the list of files changed between two refs.
+// Uses three-dot syntax (base...head) to show only commits in head that are not in base.
+func (g *Git) DiffFiles(base, head string) ([]string, error) {
+	out, err := g.run("diff", "--name-only", fmt.Sprintf("%s...%s", base, head))
+	if err != nil {
+		// Return empty list if refs don't exist, rather than failing
+		return []string{}, nil
+	}
+	if out == "" {
+		return []string{}, nil
+	}
+	return strings.Split(out, "\n"), nil
+}
+
 // DeleteRemoteBranch deletes a branch on the remote.
 func (g *Git) DeleteRemoteBranch(remote, branch string) error {
 	_, err := g.run("push", remote, "--delete", branch)
