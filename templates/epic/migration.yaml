@@ -1,0 +1,62 @@
+# Database/System Migration Template
+# Pattern for coordinating data or system migrations
+name: migration
+description: Safe migration pattern with backup, migrate, verify, and rollback provisions
+
+phases:
+  - name: preparation
+    issues:
+      - title: "Create backup"
+        description: "Back up all data and configurations before migration"
+        type: task
+      - title: "Document rollback plan"
+        description: "Prepare detailed rollback procedures in case of failure"
+        type: task
+      - title: "Notify stakeholders"
+        description: "Inform all affected parties of migration schedule"
+        type: task
+
+  - name: pre-migration
+    issues:
+      - title: "Validate source data"
+        description: "Verify source data integrity and completeness"
+        type: task
+      - title: "Prepare target environment"
+        description: "Set up and configure the target environment"
+        type: task
+      - title: "Run dry run"
+        description: "Execute migration in test mode to identify issues"
+        type: task
+
+  - name: migration
+    issues:
+      - title: "Execute migration"
+        description: "Run the actual migration process"
+        type: task
+      - title: "Monitor progress"
+        description: "Track migration progress and watch for errors"
+        type: task
+
+  - name: verification
+    issues:
+      - title: "Validate migrated data"
+        description: "Verify data integrity in target environment"
+        type: task
+      - title: "Run functional tests"
+        description: "Execute tests to ensure functionality is preserved"
+        type: task
+      - title: "Compare source and target"
+        description: "Reconcile data between source and target"
+        type: task
+
+  - name: cleanup
+    issues:
+      - title: "Archive backup"
+        description: "Store backup in long-term archive if migration successful"
+        type: task
+      - title: "Update documentation"
+        description: "Document completed migration and any lessons learned"
+        type: task
+      - title: "Close migration"
+        description: "Final sign-off and close out migration activities"
+        type: task

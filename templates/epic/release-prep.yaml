@@ -1,0 +1,47 @@
+# Release Preparation Template
+# A workflow for preparing and executing a release
+name: release-prep
+description: Multi-phase release preparation with validation, deploy, and verification
+
+phases:
+  - name: pre-flight
+    issues:
+      - title: "Run full test suite"
+        description: "Execute all tests to ensure release readiness"
+        type: task
+      - title: "Update changelog"
+        description: "Document all changes included in this release"
+        type: task
+      - title: "Verify dependencies"
+        description: "Check all dependencies are compatible and up to date"
+        type: task
+
+  - name: release
+    issues:
+      - title: "Tag release version"
+        description: "Create git tag and update version numbers"
+        type: task
+      - title: "Build release artifacts"
+        description: "Generate binaries, packages, or other release artifacts"
+        type: task
+
+  - name: deploy
+    issues:
+      - title: "Deploy to staging"
+        description: "Deploy release to staging environment for final validation"
+        type: task
+      - title: "Run smoke tests"
+        description: "Execute basic functionality tests in staging"
+        type: task
+
+  - name: post-release
+    issues:
+      - title: "Deploy to production"
+        description: "Roll out release to production environment"
+        type: task
+      - title: "Announce release"
+        description: "Notify stakeholders and update documentation"
+        type: task
+      - title: "Monitor metrics"
+        description: "Watch key metrics for any regression or issues"
+        type: task

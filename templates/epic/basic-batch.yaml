@@ -1,0 +1,25 @@
+# Basic Batch Work Template
+# A simple pattern for coordinating batch work across workers
+name: basic-batch
+description: Simple batch work pattern with startup, working, and cleanup phases
+
+phases:
+  - name: startup
+    issues:
+      - title: "Verify workers ready"
+        description: "Check that all assigned workers are available and prepared"
+        type: task
+
+  - name: working
+    # Placeholder phase - actual work issues are added separately
+    # This creates a dependency boundary between startup and cleanup
+    issues: []
+
+  - name: cleanup
+    issues:
+      - title: "Merge all branches"
+        description: "Consolidate work from all workers into the target branch"
+        type: task
+      - title: "Clean up workers"
+        description: "Release workers and clean up any temporary resources"
+        type: task

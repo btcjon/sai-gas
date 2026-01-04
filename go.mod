@@ -10,6 +10,7 @@ require (
 	github.com/spf13/cobra v1.8.1
 	golang.org/x/term v0.38.0
 	golang.org/x/text v0.3.8
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
