@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/plan"
+	"github.com/steveyegge/gastown/internal/planoracle"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -22,26 +24,26 @@ var (
 	planImportLabel   string
 	planImportDryRun  bool
 	planStructureDeps bool
+	planOracleJSON    bool
+	planOracleCreate  bool
 )
 
 var planCmd = &cobra.Command{
 	Use:     "plan",
 	GroupID: GroupWork,
-	Short:   "Convert planning inputs into beads epics",
+	Short:   "Planning and decomposition tools",
 	RunE:    requireSubcommand,
-	Long: `Convert planning inputs into beads epics.
+	Long: `Planning and decomposition tools for managing work.
 
-This command helps convert external planning documents (markdown files,
-GitHub issues) into structured beads epics with tasks and dependencies.
-
-Commands:
-  import     Import tasks from markdown or GitHub
-  structure  Analyze epic children and add dependencies
+Subcommands:
+  import      Import tasks from markdown or GitHub
+  structure   Analyze epic children and add dependencies
+  oracle      Analyze issues and suggest work decomposition
 
 Examples:
   gt plan import --from markdown plan.md
-  gt plan import --from github --repo owner/repo --label epic
-  gt plan structure gt-abc123`,
+  gt plan structure gt-abc123
+  gt plan oracle analyze gt-xyz`,
 }
 
 var planImportCmd = &cobra.Command{
@@ -92,6 +94,63 @@ Examples:
 	RunE: runPlanStructure,
 }
 
+var planOracleCmd = &cobra.Command{
+	Use:     "oracle",
+	Aliases: []string{"decompose"},
+	Short:   "Analyze issues and suggest work decomposition",
+	RunE:    requireSubcommand,
+	Long: `Analyze issues/epics and suggest how to decompose them into sub-tasks.
+
+The plan-oracle plugin provides:
+  - Scope analysis: Identify components and sub-tasks
+  - Dependency detection: Find implicit dependencies between tasks
+  - Complexity estimation: Estimate relative complexity (S/M/L/XL)
+  - Parallelization: Identify tasks that can run in parallel
+
+Examples:
+  gt plan oracle analyze gt-abc123
+  gt plan oracle decompose gt-abc123`,
+}
+
+var planOracleAnalyzeCmd = &cobra.Command{
+	Use:   "analyze <issue-id>",
+	Short: "Analyze issue and suggest decomposition",
+	Long: `Analyze an issue and suggest how it could be decomposed into sub-tasks.
+
+Output includes:
+  - Identified components and action items
+  - Suggested sub-tasks with complexity estimates
+  - Dependency relationships
+  - Tasks that can run in parallel
+  - Estimated total effort
+  - Recommendations
+
+Examples:
+  gt plan oracle analyze gt-abc123
+  gt plan oracle analyze gt-abc123 --json`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPlanOracleAnalyze,
+}
+
+var planOracleDecomposeCmd = &cobra.Command{
+	Use:   "decompose <issue-id>",
+	Short: "Analyze and create sub-task beads",
+	Long: `Analyze an issue and automatically create sub-task beads.
+
+This command:
+1. Analyzes the issue for decomposition opportunities
+2. Creates child beads for each suggested sub-task
+3. Adds dependency relationships between tasks
+
+Use --dry-run to preview without creating beads.
+
+Examples:
+  gt plan oracle decompose gt-abc123
+  gt plan oracle decompose gt-abc123 --dry-run`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPlanOracleDecompose,
+}
+
 func init() {
 	// Import flags
 	planImportCmd.Flags().StringVar(&planImportFrom, "from", "markdown", "Source type: markdown or github")
@@ -102,9 +161,19 @@ func init() {
 	// Structure flags
 	planStructureCmd.Flags().BoolVar(&planStructureDeps, "deps", true, "Add dependencies (set false to analyze only)")
 
-	// Add subcommands
+	// Oracle flags
+	planOracleAnalyzeCmd.Flags().BoolVar(&planOracleJSON, "json", false, "Output analysis in JSON format")
+	planOracleDecomposeCmd.Flags().BoolVar(&planOracleJSON, "json", false, "Output as JSON")
+	planOracleDecomposeCmd.Flags().BoolVar(&planOracleCreate, "create", true, "Create child beads (set false for dry-run)")
+
+	// Add oracle subcommands
+	planOracleCmd.AddCommand(planOracleAnalyzeCmd)
+	planOracleCmd.AddCommand(planOracleDecomposeCmd)
+
+	// Add all plan subcommands
 	planCmd.AddCommand(planImportCmd)
 	planCmd.AddCommand(planStructureCmd)
+	planCmd.AddCommand(planOracleCmd)
 
 	rootCmd.AddCommand(planCmd)
 }
@@ -510,4 +579,198 @@ func extractIDFromJSON(jsonStr string) string {
 	}
 
 	return jsonStr[start : start+end]
+}
+
+// runPlanOracleAnalyze analyzes an issue for decomposition suggestions.
+func runPlanOracleAnalyze(cmd *cobra.Command, args []string) error {
+	issueID := args[0]
+
+	// Find working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("getting current directory: %w", err)
+	}
+
+	// Resolve beads directory
+	beadsDir := beads.ResolveBeadsDir(cwd)
+
+	// Create analyzer
+	analyzer := planoracle.New(beadsDir)
+
+	// Analyze the issue
+	analysis, err := analyzer.AnalyzeIssue(issueID)
+	if err != nil {
+		return fmt.Errorf("analyzing issue: %w", err)
+	}
+
+	// Output results
+	if planOracleJSON {
+		// JSON output
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(analysis)
+	}
+
+	// Human-readable output
+	fmt.Printf("%s Decomposition Analysis for %s\n\n", style.Bold.Render("📊"), style.Bold.Render(issueID))
+	fmt.Printf("%s %s\n\n", style.Dim.Render("Issue:"), analysis.IssueTitle)
+
+	// Sub-tasks section
+	fmt.Println(style.Bold.Render("Suggested Sub-tasks:"))
+	for _, task := range analysis.SubTasks {
+		fmt.Printf("  %d. [%s] %s\n", task.Index, task.Complexity, task.Title)
+		if task.Description != "" && task.Description != task.Title {
+			fmt.Printf("     %s\n", style.Dim.Render(task.Description))
+		}
+		if len(task.Dependencies) > 0 {
+			deps := make([]string, len(task.Dependencies))
+			for i, d := range task.Dependencies {
+				deps[i] = fmt.Sprintf("%d", d)
+			}
+			fmt.Printf("     %s depends on: %s\n", style.Dim.Render("→"), strings.Join(deps, ", "))
+		}
+	}
+	fmt.Println()
+
+	// Parallel groups section
+	if len(analysis.ParallelGroups) > 0 {
+		fmt.Println(style.Bold.Render("Parallelizable:"))
+		for _, group := range analysis.ParallelGroups {
+			groupStrs := make([]string, len(group))
+			for i, idx := range group {
+				groupStrs[i] = fmt.Sprintf("%d", idx)
+			}
+			fmt.Printf("  - Tasks %s can run in parallel\n", strings.Join(groupStrs, ", "))
+		}
+		fmt.Println()
+	}
+
+	// Effort estimate
+	fmt.Printf("%s %s\n\n", style.Bold.Render("Estimated effort:"), analysis.EstimatedEffort)
+
+	// Recommendations
+	if len(analysis.Recommendations) > 0 {
+		fmt.Println(style.Bold.Render("Recommendations:"))
+		for _, rec := range analysis.Recommendations {
+			fmt.Printf("  → %s\n", rec)
+		}
+		fmt.Println()
+	}
+
+	return nil
+}
+
+// runPlanOracleDecompose analyzes and creates sub-task beads.
+func runPlanOracleDecompose(cmd *cobra.Command, args []string) error {
+	issueID := args[0]
+
+	// Find working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("getting current directory: %w", err)
+	}
+
+	// Resolve beads directory
+	beadsDir := beads.ResolveBeadsDir(cwd)
+
+	// Create analyzer
+	analyzer := planoracle.New(beadsDir)
+
+	// Analyze the issue
+	analysis, err := analyzer.AnalyzeIssue(issueID)
+	if err != nil {
+		return fmt.Errorf("analyzing issue: %w", err)
+	}
+
+	// Output analysis
+	fmt.Printf("%s Decomposition Analysis for %s\n\n", style.Bold.Render("📊"), style.Bold.Render(issueID))
+	fmt.Printf("%s %s\n\n", style.Dim.Render("Issue:"), analysis.IssueTitle)
+	fmt.Printf("%s Found %d potential sub-tasks\n\n", style.Bold.Render("->"), len(analysis.SubTasks))
+
+	// Show what we'll create
+	fmt.Println(style.Bold.Render("Sub-tasks to create:"))
+	for _, task := range analysis.SubTasks {
+		fmt.Printf("  [%s] %s\n", task.Complexity, task.Title)
+	}
+	fmt.Println()
+
+	// If not creating, stop here
+	if !planOracleCreate {
+		fmt.Printf("%s Dry run - no beads created\n", style.Dim.Render("Note:"))
+		return nil
+	}
+
+	// Create child beads
+	fmt.Printf("%s Creating sub-task beads...\n\n", style.Bold.Render("->"))
+
+	taskIDMap := make(map[int]string) // index -> bead ID
+
+	for _, task := range analysis.SubTasks {
+		// Create child bead
+		createArgs := []string{
+			"create",
+			fmt.Sprintf("--title=%s", task.Title),
+			fmt.Sprintf("--description=%s", task.Description),
+			fmt.Sprintf("--parent=%s", issueID),
+			fmt.Sprintf("--type=task"),
+		}
+
+		createCmd := exec.Command("bd", createArgs...)
+		createCmd.Dir = beadsDir
+		output, err := createCmd.Output()
+		if err != nil {
+			fmt.Printf("   %s Failed to create task %q: %v\n", style.Dim.Render("[!]"), task.Title, err)
+			continue
+		}
+
+		taskID := extractIDFromJSON(string(output))
+		if taskID == "" {
+			fmt.Printf("   %s Could not parse ID for task %q\n", style.Dim.Render("[!]"), task.Title)
+			continue
+		}
+
+		taskIDMap[task.Index] = taskID
+		fmt.Printf("   %s Created: %s [%s] %s\n", style.Dim.Render("[+]"), taskID, task.Complexity, task.Title)
+	}
+
+	// Add dependencies
+	fmt.Printf("\n%s Adding task dependencies...\n\n", style.Bold.Render("->"))
+	depCount := 0
+
+	for _, task := range analysis.SubTasks {
+		if len(task.Dependencies) == 0 {
+			continue
+		}
+
+		taskID, ok := taskIDMap[task.Index]
+		if !ok {
+			continue
+		}
+
+		for _, depIdx := range task.Dependencies {
+			depID, ok := taskIDMap[depIdx]
+			if !ok {
+				continue
+			}
+
+			// Add dependency
+			depCmd := exec.Command("bd", "dep", "add", taskID, depID)
+			depCmd.Dir = beadsDir
+			if err := depCmd.Run(); err != nil {
+				fmt.Printf("   %s Failed: %s depends on %s\n", style.Dim.Render("[!]"), taskID, depID)
+				continue
+			}
+
+			fmt.Printf("   %s %s depends on %s\n", style.Dim.Render("[+]"), taskID, depID)
+			depCount++
+		}
+	}
+
+	// Summary
+	fmt.Printf("\n%s Decomposition complete!\n\n", style.Bold.Render("[/]"))
+	fmt.Printf("   Sub-tasks created: %d\n", len(taskIDMap))
+	fmt.Printf("   Dependencies added: %d\n", depCount)
+	fmt.Printf("\n   View parent: bd show %s\n", issueID)
+
+	return nil
 }
