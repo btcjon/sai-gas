@@ -15,6 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/monitoring"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -23,6 +24,7 @@ import (
 
 var statusJSON bool
 var statusFast bool
+var statusMonitor bool
 
 var statusCmd = &cobra.Command{
 	Use:     "status",
@@ -33,13 +35,15 @@ var statusCmd = &cobra.Command{
 
 Shows town name, registered rigs, active polecats, and witness status.
 
-Use --fast to skip mail lookups for faster execution.`,
+Use --fast to skip mail lookups for faster execution.
+Use --monitor to infer agent activity status from pane output.`,
 	RunE: runStatus,
 }
 
 func init() {
 	statusCmd.Flags().BoolVar(&statusJSON, "json", false, "Output as JSON")
 	statusCmd.Flags().BoolVar(&statusFast, "fast", false, "Skip mail lookups for faster execution")
+	statusCmd.Flags().BoolVar(&statusMonitor, "monitor", false, "Infer agent activity status from pane output")
 	rootCmd.AddCommand(statusCmd)
 }
 
@@ -64,17 +68,19 @@ type OverseerInfo struct {
 
 // AgentRuntime represents the runtime state of an agent.
 type AgentRuntime struct {
-	Name         string `json:"name"`                    // Display name (e.g., "mayor", "witness")
-	Address      string `json:"address"`                 // Full address (e.g., "greenplace/witness")
-	Session      string `json:"session"`                 // tmux session name
-	Role         string `json:"role"`                    // Role type
-	Running      bool   `json:"running"`                 // Is tmux session running?
-	HasWork      bool   `json:"has_work"`                // Has pinned work?
-	WorkTitle    string `json:"work_title,omitempty"`    // Title of pinned work
-	HookBead     string `json:"hook_bead,omitempty"`     // Pinned bead ID from agent bead
-	State        string `json:"state,omitempty"`         // Agent state from agent bead
-	UnreadMail   int    `json:"unread_mail"`             // Number of unread messages
-	FirstSubject string `json:"first_subject,omitempty"` // Subject of first unread message
+	Name           string `json:"name"`                    // Display name (e.g., "mayor", "witness")
+	Address        string `json:"address"`                 // Full address (e.g., "greenplace/witness")
+	Session        string `json:"session"`                 // tmux session name
+	Role           string `json:"role"`                    // Role type
+	Running        bool   `json:"running"`                 // Is tmux session running?
+	HasWork        bool   `json:"has_work"`                // Has pinned work?
+	WorkTitle      string `json:"work_title,omitempty"`    // Title of pinned work
+	HookBead       string `json:"hook_bead,omitempty"`     // Pinned bead ID from agent bead
+	State          string `json:"state,omitempty"`         // Agent state from agent bead
+	UnreadMail     int    `json:"unread_mail"`             // Number of unread messages
+	FirstSubject   string `json:"first_subject,omitempty"` // Subject of first unread message
+	MonitorStatus  string `json:"monitor_status,omitempty"`// Inferred status (thinking, working, blocked, etc.)
+	ActivityStatus string `json:"activity_status,omitempty"` // Activity pattern matched
 }
 
 // RigStatus represents status of a single rig.
@@ -230,11 +236,17 @@ func runStatus(cmd *cobra.Command, args []string) error {
 
 	var wg sync.WaitGroup
 
+	// Create monitoring tracker if enabled
+	var tracker *monitoring.Tracker
+	if statusMonitor {
+		tracker = monitoring.NewTracker(t)
+	}
+
 	// Fetch global agents in parallel with rig discovery
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		status.Agents = discoverGlobalAgents(allSessions, allAgentBeads, allHookBeads, mailRouter, statusFast)
+		status.Agents = discoverGlobalAgents(allSessions, allAgentBeads, allHookBeads, mailRouter, statusFast, tracker)
 	}()
 
 	// Process all rigs in parallel
@@ -273,7 +285,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			rigActiveHooks[idx] = activeHooks
 
 			// Discover runtime state for all agents in this rig
-			rs.Agents = discoverRigAgents(allSessions, r, rs.Crews, allAgentBeads, allHookBeads, mailRouter, statusFast)
+			rs.Agents = discoverRigAgents(allSessions, r, rs.Crews, allAgentBeads, allHookBeads, mailRouter, statusFast, tracker)
 
 			// Get MQ summary if rig has a refinery
 			rs.MQ = getMQSummary(r)
@@ -523,7 +535,16 @@ func renderAgentDetails(agent AgentRuntime, indent string, hooks []AgentHookInfo
 
 	fmt.Printf("%s  hook: %s\n", indent, hookStr)
 
-	// Line 3: Mail (if any unread)
+	// Line 3: Monitor status (if available)
+	if agent.MonitorStatus != "" {
+		monitorStr := agent.MonitorStatus
+		if agent.ActivityStatus != "" {
+			monitorStr = fmt.Sprintf("%s (%s)", agent.MonitorStatus, agent.ActivityStatus)
+		}
+		fmt.Printf("%s  activity: %s\n", indent, monitorStr)
+	}
+
+	// Line 4: Mail (if any unread)
 	if agent.UnreadMail > 0 {
 		mailStr := fmt.Sprintf("📬 %d unread", agent.UnreadMail)
 		if agent.FirstSubject != "" {
@@ -604,7 +625,8 @@ func discoverRigHooks(r *rig.Rig, crews []string) []AgentHookInfo {
 // allSessions is a preloaded map of tmux sessions for O(1) lookup.
 // allAgentBeads is a preloaded map of agent beads for O(1) lookup.
 // allHookBeads is a preloaded map of hook beads for O(1) lookup.
-func discoverGlobalAgents(allSessions map[string]bool, allAgentBeads map[string]*beads.Issue, allHookBeads map[string]*beads.Issue, mailRouter *mail.Router, skipMail bool) []AgentRuntime {
+// tracker is optional and used for status inference if enabled.
+func discoverGlobalAgents(allSessions map[string]bool, allAgentBeads map[string]*beads.Issue, allHookBeads map[string]*beads.Issue, mailRouter *mail.Router, skipMail bool, tracker *monitoring.Tracker) []AgentRuntime {
 	// Define agents to discover
 	agentDefs := []struct {
 		name    string
@@ -668,6 +690,15 @@ func discoverGlobalAgents(allSessions map[string]bool, allAgentBeads map[string]
 				populateMailInfo(&agent, mailRouter)
 			}
 
+			// Infer status from pane output if monitoring enabled
+			if tracker != nil {
+				agentStatus := tracker.InferStatus(d.address, d.session, agent.State, agent.HasWork)
+				if agentStatus != nil {
+					agent.MonitorStatus = agentStatus.Status
+					agent.ActivityStatus = agentStatus.MatchedPattern
+				}
+			}
+
 			agents[idx] = agent
 		}(i, def)
 	}
@@ -708,7 +739,8 @@ type agentDef struct {
 // allSessions is a preloaded map of tmux sessions for O(1) lookup.
 // allAgentBeads is a preloaded map of agent beads for O(1) lookup.
 // allHookBeads is a preloaded map of hook beads for O(1) lookup.
-func discoverRigAgents(allSessions map[string]bool, r *rig.Rig, crews []string, allAgentBeads map[string]*beads.Issue, allHookBeads map[string]*beads.Issue, mailRouter *mail.Router, skipMail bool) []AgentRuntime {
+// tracker is optional and used for status inference if enabled.
+func discoverRigAgents(allSessions map[string]bool, r *rig.Rig, crews []string, allAgentBeads map[string]*beads.Issue, allHookBeads map[string]*beads.Issue, mailRouter *mail.Router, skipMail bool, tracker *monitoring.Tracker) []AgentRuntime {
 	// Build list of all agents to discover
 	var defs []agentDef
 	townRoot := filepath.Dir(r.Path)
@@ -806,6 +838,15 @@ func discoverRigAgents(allSessions map[string]bool, r *rig.Rig, crews []string, 
 			// Get mail info (skip if --fast)
 			if !skipMail {
 				populateMailInfo(&agent, mailRouter)
+			}
+
+			// Infer status from pane output if monitoring enabled
+			if tracker != nil {
+				agentStatus := tracker.InferStatus(d.address, d.session, agent.State, agent.HasWork)
+				if agentStatus != nil {
+					agent.MonitorStatus = agentStatus.Status
+					agent.ActivityStatus = agentStatus.MatchedPattern
+				}
 			}
 
 			agents[idx] = agent
