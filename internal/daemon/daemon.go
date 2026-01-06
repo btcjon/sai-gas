@@ -20,7 +20,9 @@ import (
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/feed"
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -199,6 +201,10 @@ func (d *Daemon) heartbeat(state *State) {
 	// 8. Check polecat session health (proactive crash detection)
 	// This validates tmux sessions are still alive for polecats with work-on-hook
 	d.checkPolecatSessionHealth()
+
+	// 9. Ensure polecat pools are maintained (Phase 3: Full Ferrari automation)
+	// This pre-creates idle polecats so work can be assigned without spawn latency
+	d.ensurePolecatPools()
 
 	// Update state
 	state.LastHeartbeat = time.Now()
@@ -929,4 +935,201 @@ Manual intervention may be required.`,
 	if err := cmd.Run(); err != nil {
 		d.logger.Printf("Warning: failed to notify witness of crashed polecat: %v", err)
 	}
+}
+
+// ensurePolecatPools ensures minimum polecat pools exist for all rigs.
+// Called on each heartbeat to maintain ready-to-work polecats.
+func (d *Daemon) ensurePolecatPools() {
+	// Check if pool management is enabled (default: enabled)
+	if !d.isPoolManagementEnabled() {
+		return
+	}
+
+	rigs := d.getKnownRigs()
+	for _, rigName := range rigs {
+		d.ensurePolecatPool(rigName)
+	}
+}
+
+// ensurePolecatPool ensures minimum polecats exist for a specific rig.
+// Creates idle polecats up to the minimum pool size if needed.
+func (d *Daemon) ensurePolecatPool(rigName string) {
+	// Get pool config for this rig (may be overridden per-rig)
+	minPool, maxPool := d.getPoolConfig(rigName)
+	if minPool <= 0 {
+		// Pool disabled for this rig
+		return
+	}
+
+	// Get current polecat count and idle count for this rig
+	polecatsDir := filepath.Join(d.config.TownRoot, rigName, "polecats")
+	entries, err := os.ReadDir(polecatsDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			d.logger.Printf("Error reading polecats dir for %s: %v", rigName, err)
+		}
+		// Create polecats directory if it doesn't exist
+		if os.IsNotExist(err) {
+			if mkdirErr := os.MkdirAll(polecatsDir, 0755); mkdirErr != nil {
+				d.logger.Printf("Error creating polecats dir for %s: %v", rigName, mkdirErr)
+				return
+			}
+		}
+		entries = nil
+	}
+
+	// Count existing polecats and idle polecats
+	totalCount := 0
+	idleCount := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		totalCount++
+
+		// Check if this polecat is idle (no hook_bead)
+		polecatName := entry.Name()
+		agentBeadID := beads.PolecatBeadID(rigName, polecatName)
+		info, err := d.getAgentBeadInfo(agentBeadID)
+		if err != nil {
+			// Agent bead doesn't exist - treat as idle (not working)
+			idleCount++
+			continue
+		}
+		if info.HookBead == "" {
+			idleCount++
+		}
+	}
+
+	// Log pool status
+	d.logger.Printf("Pool status for %s: total=%d, idle=%d, min=%d, max=%d",
+		rigName, totalCount, idleCount, minPool, maxPool)
+
+	// Create polecats if below minimum idle threshold
+	if idleCount >= minPool {
+		return // Already have enough idle polecats
+	}
+
+	// Don't exceed max pool
+	toCreate := minPool - idleCount
+	if totalCount+toCreate > maxPool {
+		toCreate = maxPool - totalCount
+	}
+
+	if toCreate <= 0 {
+		return
+	}
+
+	d.logger.Printf("Creating %d polecat(s) for %s to meet pool minimum", toCreate, rigName)
+
+	// Create polecats using polecat manager
+	for i := 0; i < toCreate; i++ {
+		if err := d.createPoolPolecat(rigName); err != nil {
+			d.logger.Printf("Error creating pool polecat for %s: %v", rigName, err)
+			break // Stop on first error to avoid spam
+		}
+	}
+}
+
+// createPoolPolecat creates a new idle polecat for the pool.
+func (d *Daemon) createPoolPolecat(rigName string) error {
+	rigPath := filepath.Join(d.config.TownRoot, rigName)
+
+	// Use polecat manager to allocate name and create worktree
+	r := &rig.Rig{
+		Name: rigName,
+		Path: rigPath,
+	}
+	g := git.NewGit(rigPath)
+	manager := polecat.NewManager(r, g)
+
+	// Allocate a name from the pool
+	name, err := manager.AllocateName()
+	if err != nil {
+		return fmt.Errorf("allocating name: %w", err)
+	}
+
+	// Create the polecat (no hook_bead - it's idle and ready for work)
+	p, err := manager.Add(name)
+	if err != nil {
+		// Release the name if creation failed
+		manager.ReleaseName(name)
+		return fmt.Errorf("creating polecat %s: %w", name, err)
+	}
+
+	d.logger.Printf("Created pool polecat: %s/%s (path: %s)", rigName, p.Name, p.ClonePath)
+
+	// Note: We don't start a tmux session for pool polecats.
+	// Sessions are started when work is assigned via gt sling.
+	// Pool polecats are just pre-created worktrees ready to accept work.
+
+	return nil
+}
+
+// isPoolManagementEnabled checks if polecat pool management is enabled.
+// Checks GT_POLECAT_POOL_ENABLED env var first, then mayor config.
+func (d *Daemon) isPoolManagementEnabled() bool {
+	// Check environment variable override
+	if env := os.Getenv("GT_POLECAT_POOL_ENABLED"); env != "" {
+		return env == "true" || env == "1"
+	}
+
+	// Check mayor config
+	mayorConfigPath := filepath.Join(d.config.TownRoot, "mayor", "config.json")
+	cfg, err := config.LoadMayorConfig(mayorConfigPath)
+	if err != nil || cfg.Daemon == nil || cfg.Daemon.PolecatPool == nil {
+		// Default: enabled
+		return true
+	}
+
+	return cfg.Daemon.PolecatPool.Enabled
+}
+
+// getPoolConfig returns the min and max pool sizes for a rig.
+// Checks rig-specific settings first, then daemon config, then env vars, then defaults.
+func (d *Daemon) getPoolConfig(rigName string) (minPool, maxPool int) {
+	// Defaults from env vars or hardcoded
+	minPool = d.getEnvInt("GT_MIN_POLECAT_POOL", 3)
+	maxPool = d.getEnvInt("GT_MAX_POLECAT_POOL", 5)
+
+	// Check mayor config for town-wide settings
+	mayorConfigPath := filepath.Join(d.config.TownRoot, "mayor", "config.json")
+	if cfg, err := config.LoadMayorConfig(mayorConfigPath); err == nil {
+		if cfg.Daemon != nil && cfg.Daemon.PolecatPool != nil {
+			if cfg.Daemon.PolecatPool.MinPool > 0 {
+				minPool = cfg.Daemon.PolecatPool.MinPool
+			}
+			if cfg.Daemon.PolecatPool.MaxPool > 0 {
+				maxPool = cfg.Daemon.PolecatPool.MaxPool
+			}
+		}
+	}
+
+	// Check rig-specific settings (overrides town settings)
+	rigSettingsPath := filepath.Join(d.config.TownRoot, rigName, "settings", "config.json")
+	if settings, err := config.LoadRigSettings(rigSettingsPath); err == nil {
+		if settings.PolecatPool != nil {
+			if !settings.PolecatPool.Enabled {
+				return 0, 0 // Pool disabled for this rig
+			}
+			if settings.PolecatPool.MinPool > 0 {
+				minPool = settings.PolecatPool.MinPool
+			}
+			if settings.PolecatPool.MaxPool > 0 {
+				maxPool = settings.PolecatPool.MaxPool
+			}
+		}
+	}
+
+	return minPool, maxPool
+}
+
+// getEnvInt gets an integer from environment variable with a default value.
+func (d *Daemon) getEnvInt(key string, defaultVal int) int {
+	if val := os.Getenv(key); val != "" {
+		if n, err := strconv.Atoi(val); err == nil {
+			return n
+		}
+	}
+	return defaultVal
 }

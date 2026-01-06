@@ -1,0 +1,20 @@
+[Unit]
+Description=Gas Town (GT) Daemon - Multi-agent orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dev
+Environment="HOME=/home/dev"
+Environment="PATH=/usr/local/go/bin:/home/dev/go/bin:/home/dev/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="GOPATH=/home/dev/go"
+WorkingDirectory=/home/dev
+ExecStart=/home/dev/go/bin/gt daemon run
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

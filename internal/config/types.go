@@ -62,8 +62,35 @@ func NewTownSettings() *TownSettings {
 
 // DaemonConfig represents daemon process settings.
 type DaemonConfig struct {
-	HeartbeatInterval string `json:"heartbeat_interval,omitempty"` // e.g., "30s"
-	PollInterval      string `json:"poll_interval,omitempty"`      // e.g., "10s"
+	HeartbeatInterval string           `json:"heartbeat_interval,omitempty"` // e.g., "30s"
+	PollInterval      string           `json:"poll_interval,omitempty"`      // e.g., "10s"
+	PolecatPool       *PolecatPoolConfig `json:"polecat_pool,omitempty"`       // pool management settings
+}
+
+// PolecatPoolConfig represents polecat pool management settings.
+// The daemon maintains a minimum pool of idle polecats per rig,
+// ready to accept work without spawn latency.
+type PolecatPoolConfig struct {
+	// Enabled controls whether pool management is active.
+	// Default: true (when config exists)
+	Enabled bool `json:"enabled"`
+
+	// MinPool is the minimum number of idle polecats to maintain per rig.
+	// Default: 3 (from GT_MIN_POLECAT_POOL env var)
+	MinPool int `json:"min_pool,omitempty"`
+
+	// MaxPool is the maximum number of polecats allowed per rig.
+	// Default: 5 (from GT_MAX_POLECAT_POOL env var)
+	MaxPool int `json:"max_pool,omitempty"`
+}
+
+// DefaultPolecatPoolConfig returns a PolecatPoolConfig with sensible defaults.
+func DefaultPolecatPoolConfig() *PolecatPoolConfig {
+	return &PolecatPoolConfig{
+		Enabled: true,
+		MinPool: 3,
+		MaxPool: 5,
+	}
 }
 
 // DeaconConfig represents deacon process settings.
@@ -138,6 +165,10 @@ type RigSettings struct {
 	// If empty, uses the town's default_agent setting.
 	// Takes precedence over Runtime if both are set.
 	Agent string `json:"agent,omitempty"`
+
+	// PolecatPool overrides the town-level polecat pool settings for this rig.
+	// If nil, uses the town daemon's pool settings.
+	PolecatPool *PolecatPoolConfig `json:"polecat_pool,omitempty"`
 }
 
 // CrewConfig represents crew workspace settings for a rig.
