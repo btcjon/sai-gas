@@ -1,0 +1,14 @@
+[Unit]
+Description=Gas Town (GT) auto-update
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=dev
+Environment="HOME=/home/dev"
+Environment="PATH=/usr/local/go/bin:/home/dev/go/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="GOPATH=/home/dev/go"
+WorkingDirectory=/home/dev/Dropbox/Projects/sai-gas
+ExecStart=/home/dev/Dropbox/Projects/sai-gas/scripts/auto-update-gt.sh
+StandardOutput=journal
+StandardError=journal

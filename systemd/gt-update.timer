@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly Gas Town (GT) update check
+
+[Timer]
+# Run every Sunday at 00:30 (30 min after CLIProxyAPI)
+OnCalendar=Sun *-*-* 00:30:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
