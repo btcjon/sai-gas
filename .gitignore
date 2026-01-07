@@ -19,6 +19,12 @@ Thumbs.db
 
 # Claude Code local state
 .claude/
+.claude-shared
+.claude-user
+
+# SAI runtime state
+.sai-bead
+.osgrep/
 
 # Test
 coverage.out
