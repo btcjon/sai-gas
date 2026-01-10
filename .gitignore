@@ -56,3 +56,6 @@ CLAUDE.md
 
 # Embedded formulas are committed so `go install @latest` works
 # Run `go generate ./...` after modifying .beads/formulas/
+.claude-home
+home
+user-docs
